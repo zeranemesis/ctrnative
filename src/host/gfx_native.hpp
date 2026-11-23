@@ -53,6 +53,7 @@ public:
     kGfxVec4 = 28,
     kGameDraw = 29,
     kGameVertexFormat = 30, // after the game's function
+    kAroundFirst = 31,      // 31-38: around the game's function (tools/ctrn.py AROUND_NATIVES)
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -100,7 +101,7 @@ private:
   } palette_;
   bool palette_rows(uint32_t where, uint32_t source, bool first, uint32_t header);
   void pad(uint32_t at, uint32_t words);
-  bool written(uint32_t start, uint32_t end);
+  bool written(uint32_t start, uint32_t end, uint64_t holder);
   bool uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3);
   bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);

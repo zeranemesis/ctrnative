@@ -408,11 +408,30 @@ GFX_NATIVES = [
      [0xE92D00F0, 0xE3A03001, 0xE5D20008, 0xE59F6080, 0xE3500000, 0xE59F0074, 0x13A05000, 0x03A05102, 0xE2464038, 0xE590C000, 0xE5920000, 0xE8810048, 0xE26CC000, 0xE080C18C, 0xE2810008, 0xE185700C]),
     (30, "NSMB2: a vertex format's commands written (translated after)",
      [0xE92D4FF0, 0xE24DD05C, 0xE1A08000, 0xE1A03001, 0xE3A02000, 0xE59FC4FC, 0xE59F04FC, 0xE59F54FC, 0xE5A1C004, 0xE2816004, 0xE2811008, 0xE28D7024, 0xE8810005, 0xE2811004, 0xE0854840, 0xE58D1004]),
+    (31, "nw::gfx: a material activated (simple activator) (translated around)",
+     [0xE92D4FF7, 0xE24DD078, 0xE59D007C, 0xE2806040, 0xE5D000E8, 0xE5D610AB, 0xE3500000, 0x05D600A9, 0x03500000, 0x13A00001, 0xE58D0064, 0xE59D007C]),
+    (32, "nw::gfx: a material activated (translated around)",
+     [0xE92D4FF7, 0xE24DD070, 0xE1A08002, 0xE59D0074, 0xE2805040, 0xE5D010E8, 0xE5906008, 0xE3510000, 0x05D500A9, 0xE5D510AB, 0x03500000, 0x13A00001]),
+    (33, "nw::gfx: lighting tables' inputs set (translated around)",
+     [0xE92D4FF0, 0xE3A03002, 0xE24DD00C, 0xE1A04001, 0xE3A09000, 0xE5902000, 0xE59F63EC, 0xE59F73EC, 0xE1D33002, 0x03A0B001, 0x13A0B000, 0xE3A03004]),
+    (34, "nw::gfx: texture coordinates set (translated around)",
+     [0xE92D4FF7, 0xE1A07001, 0xE1A06002, 0xE59F03C4, 0xE59F93C8, 0xE59FA3C8, 0xE2801008, 0xED2D8B06, 0xE24DDE11, 0xE28AB501, 0xE5904010, 0xE5903004]),
+    (35, "nw::gfx: light environment set (translated around)",
+     [0xE92D4FFF, 0xE24DD024, 0xE2821020, 0xE3A09000, 0xE59FA3B0, 0xE58D2004, 0xE59F43A4, 0xE3A02156, 0xE59A0000, 0xE8A00014, 0xEBFE4A2A, 0xE59A0000]),
+    (36, "NSMB2: a render target set (translated around)",
+     [0xE92D4070, 0xE1A04000, 0xE5D0005C, 0xE1A05002, 0xE3500000, 0xE3A00000, 0x0A00000D, 0xE5D4005D, 0xE3500000, 0x0A000002, 0xE3500001, 0x0A000004]),
+    (37, "nw::gfx: dummy commands written (translated around)",
+     [0xE92D0E30, 0xE8B1003C, 0xF5D1F040, 0xE8B11E00, 0xE8A0003C, 0xE8A01E00, 0xE8B1003C, 0xF5D1F040, 0xE8B11E00, 0xE8A0003C, 0xE8A01E00, 0xE8B1003C]),
+    (38, "nngx: the list split (SDK 2012) (translated around)",
+     [0xE92D41F0, 0xE59F5190, 0xE59F0190, 0xE595409C, 0xE5901000, 0xE5942004, 0xE0412002, 0xE584200C, 0xE5943014, 0xE1530002, 0x0A00005A, 0xE59F3170]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8, 30}
 # copies: the host is asked only when the destination is where the game's next command goes
 LIST_COPY_NATIVES = {16, 17, 18}
+# natives around the game's function: it runs, then the host takes what it wrote at the cursor (r2: where the cursor
+# was, r3: where it is) as one operation; the game's code computes, the host sets, picanative reads nothing there
+AROUND_NATIVES = set(range(31, 39))
 NNGX_ADD_3D_COMMAND = 12  # its literal at +0x10 is that place's address
 
 
@@ -464,6 +483,22 @@ def natives_source(found, cursor=None):
                        f"        if (ctx->r[12] != 0) RETURN_TO(ctx->r[14]);\n"
                        f"    }}\n"
                        f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                       f"}}\n")
+            continue
+        if number in AROUND_NATIVES:
+            if cursor is None:
+                continue
+            out.append(f"/* {what} */\n"
+                       f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                       f"    const uint32_t a0 = ctx->r[0], a1 = ctx->r[1], before = mem_read32_in(FASTMEM(ctx), 0x{cursor:08X}u);\n"
+                       f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                       f"    const uint32_t back = ctx->r[15] | (ctx->thumb ? 1u : 0u), result = ctx->r[0], r1 = ctx->r[1];\n"
+                       f"    ctx->r[0] = a0, ctx->r[1] = a1, ctx->r[2] = before;\n"
+                       f"    ctx->r[3] = mem_read32_in(FASTMEM(ctx), 0x{cursor:08X}u);\n"
+                       f"    ctx->r[12] = {number}u;\n"
+                       f"    SVC(0x{address:08X}u, 0xF0u);\n"
+                       f"    ctx->r[0] = result, ctx->r[1] = r1;\n"
+                       f"    RETURN_TO(back);\n"
                        f"}}\n")
             continue
         if number in AFTER_NATIVES:

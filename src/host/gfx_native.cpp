@@ -25,6 +25,14 @@ const char* name(uint32_t which) {
   case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   case GfxNatives::kViewport: return "NSMB2: a viewport set";
+  case GfxNatives::kAroundFirst + 0: return "nw::gfx: a material activated (simple), around";
+  case GfxNatives::kAroundFirst + 1: return "nw::gfx: a material activated, around";
+  case GfxNatives::kAroundFirst + 2: return "nw::gfx: lighting tables' inputs, around";
+  case GfxNatives::kAroundFirst + 3: return "nw::gfx: texture coordinates, around";
+  case GfxNatives::kAroundFirst + 4: return "nw::gfx: light environment, around";
+  case GfxNatives::kAroundFirst + 5: return "NSMB2: a render target, around";
+  case GfxNatives::kAroundFirst + 6: return "nw::gfx: dummy commands, around";
+  case GfxNatives::kAroundFirst + 7: return "nngx: the list split, around";
   case GfxNatives::kGameDraw: return "NSMB2: an indexed draw";
   case GfxNatives::kGameVertexFormat: return "NSMB2: a vertex format set (translated after)";
   case GfxNatives::kGfxCamera: return "nw::gfx: a camera's matrices sent";
@@ -546,13 +554,13 @@ void GfxNatives::pad(uint32_t at, uint32_t words) {
   }
 }
 
-bool GfxNatives::written(uint32_t start, uint32_t end) {
+bool GfxNatives::written(uint32_t start, uint32_t end, uint64_t who) {
   // a game function's commands, just written at [start, end): as an operation, its mark and a padding in their place
   // (the game computed the values, its own code; the host sets them, picanative reads nothing there)
   if (end <= start || ((end - start) & 7) || end - start > 0x4000) return false;
   const uint32_t id = translated(start, end - start);
   if (!id) return false;
-  pad(mark_at(start, id, kAtItsPlace), (end - start) / 4 - 2);
+  pad(mark_at(start, id, who), (end - start) / 4 - 2);
   return true;
 }
 
@@ -741,7 +749,14 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     break;
   }
   case kGameVertexFormat: // after NSMB2 0x487ea0(layout, where): what it wrote, up to where it stopped (r3)
-    done = written(r[1], r[3]);
+    done = written(r[1], r[3], kAtItsPlace);
+    break;
+  case kAroundFirst + 0: case kAroundFirst + 1: case kAroundFirst + 2: case kAroundFirst + 3:
+  case kAroundFirst + 4: case kAroundFirst + 5: case kAroundFirst + 6: case kAroundFirst + 7:
+    // what the game's function just wrote at the cursor, [r2, r3): an operation of the frame (or the recording)
+    if (!lyt_.cursor) lyt_.cursor = 0; // the cursor's place is in the generated code; the words are where they are
+    done = r[3] != r[2] && written(r[2], r[3], 0);
+    if (r[3] != r[2] && !done) ++refused_copies_[(r[3] - r[2]) | 0x40000000u];
     break;
   case kViewport: { // 0x488da4(rect {x, y, w, h}, where): the viewport's commands, written at `where`
     if (!lyt_.cursor) break; // the cursor learnt first (the words go into the current list)
@@ -857,8 +872,8 @@ void GfxNatives::report() const {
                 static_cast<unsigned long long>(done == done_.end() ? 0 : done->second));
   }
   for (const auto& [size, n] : refused_copies_)
-    std::printf("[gfx] copy into the list left to the game: %u bytes%s, %llu times\n", size & 0x7FFFFFFF,
-                size >> 31 ? " (not translatable)" : "", static_cast<unsigned long long>(n));
+    std::printf("[gfx] %s left to the game: %u bytes%s, %llu times\n", size >> 30 == 1 ? "words written around" : "copy into the list",
+                size & 0x3FFFFFFF, size >> 31 ? " (not translatable)" : "", static_cast<unsigned long long>(n));
   if (copied_words_)
     std::printf("[gfx] blocks copied into lists: %llu words, as marks\n", static_cast<unsigned long long>(copied_words_));
   if (uncopied_words_)
