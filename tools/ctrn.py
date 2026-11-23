@@ -390,6 +390,16 @@ GFX_NATIVES = [
       0xED803A06, 0xEDC03A05, 0xED804A0C, 0xEDC04A0B, 0xED805A0A, 0xEDC05A09, 0xED806A10, 0xEDC06A0F]),
     (23, "nw::gfx: a vector written after its index command",
      [0xECB10A03, 0xE3A03000, 0xE5803000, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xE12FFF1E]),
+    # notices (the host returns no, the game's own function runs): what an operation's mark lives in
+    (24, "nngx: a recording started (SDK 2012)",
+     [0xE59F3074, 0xE92D0030, 0xE59F1070, 0xE593C09C, 0xE5910000, 0xE59C2004, 0xE0402002, 0xE3120008,
+      0xE58C200C, 0x0A000009, 0xE59F2054, 0xE5922000]),
+    (25, "nngx: a recording stopped (SDK 2012)",
+     [0xE92D03F0, 0xE3A07000, 0xE59FC088, 0xE59F4088, 0xE5CC7013, 0xE59C609C, 0xE5945000, 0xE5968004,
+      0xE0458008, 0xE3180008, 0xE586800C, 0x0A000007]),
+    (26, "nngx: a list cleared (SDK 2012)",
+     [0xE59F007C, 0xE92D4010, 0xE590409C, 0xE3540000, 0x0A00001A, 0xE5940004, 0xE3500000, 0x1A000002,
+      0xE5940018, 0xE3500000, 0x0A000014, 0xE5941020]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}

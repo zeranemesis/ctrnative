@@ -12,6 +12,9 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace host {
@@ -43,6 +46,9 @@ public:
     kGfxRows3 = 21,
     kGfxRows4 = 22,
     kGfxVec3 = 23,
+    kNngxSaveStart = 24, // notices: the game's own function runs after
+    kNngxSaveStop = 25,
+    kNngxClear = 26,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -50,6 +56,8 @@ public:
   bool call(Thread& thread, uint32_t which);
   // how often each one was called, and how often done here
   void report() const;
+  // a frame went by: what only past frames' lists held is freed
+  void frame();
 
 private:
   struct Program;
@@ -59,7 +67,12 @@ private:
   // the program as an operation, marked at the game's command cursor
   void emit(Program& program);
   // an operation's mark written at `where` (a place the game reserved in its list); the word after it
-  uint32_t mark_at(uint32_t where, uint32_t operation);
+  uint32_t mark_at(uint32_t where, uint32_t operation, uint64_t holder = 0);
+  // who keeps operations alive: a frame's lists, a recorded list, a text's list; one lives while one holds it
+  uint64_t holder() const;
+  void hold(uint64_t who, uint32_t id);
+  void release(uint64_t who);
+  void unref(uint32_t id);
   // what a block of commands the game keeps sets; false if it runs other lists
   bool commands(Program& program, uint32_t address, uint32_t bytes);
 
@@ -84,12 +97,27 @@ private:
   pn_engine* engine_;
   // operations by number - 1; by what they do, to reuse one
   // shortcut: never forgotten; menus animating make new ones for good, evict the unused if memory grows
-  std::vector<std::vector<uint32_t>> operations_;
+  struct Op {
+    std::vector<uint32_t> words;
+    uint32_t refs = 0, generation = 0;
+    bool live = false;
+  };
+  std::vector<Op> ops_;        // by number - 1
+  std::vector<uint32_t> free_; // numbers to use again
+  size_t live_ = 0;
   std::map<std::vector<uint32_t>, uint32_t> known_;
+  std::unordered_map<uint64_t, std::unordered_set<uint32_t>> holders_;
+  uint64_t frame_ = 0;
+  uint32_t recording_ = 0;     // the list nngx records, or 0
+  std::recursive_mutex mutex_; // game threads call, picanative runs (an operation may run others)
   std::map<uint32_t, uint64_t> calls_, done_;
   uint64_t unknown_marks_ = 0;
-  // blocks not copied, translated once: (address, size) → (content hash, operation)
-  std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint32_t>> translated_;
+  // blocks translated once: (address, size) → their content's hash and operation (while it lives)
+  struct Translated {
+    uint64_t hash = 0;
+    uint32_t id = 0, generation = 0;
+  };
+  std::map<std::pair<uint32_t, uint32_t>, Translated> translated_;
   uint64_t uncopied_words_ = 0, translated_words_ = 0, copied_words_ = 0;
 };
 

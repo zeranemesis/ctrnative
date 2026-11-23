@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
       std::fflush(stdout);
       pictures = 0, rate_since = now, idle_at = idle, engine_at = engine;
     }
+    gfx_natives.frame();
     if (limit && ++frames >= limit) kernel.stop("frame limit reached");
     next += period;
     const auto now = std::chrono::steady_clock::now();
