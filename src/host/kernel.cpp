@@ -430,7 +430,10 @@ void Kernel::timekeeper() {
       // a higher priority woke (a timeout, a host signal): the running thread
       // gives way at its next budget check; so does one starving the others
       Thread* next = pick();
-      const bool starving = next == running_ && Clock::now() - running_->running_since > kStarving &&
+      // the console never takes the core from a thread for one of lower priority: code may count on it, and
+      // Pokémon Y corrupted a list of its own when this did. CTRN_STARVING_RELIEF=1 does, for diagnosis only
+      static const bool relief = std::getenv("CTRN_STARVING_RELIEF") != nullptr;
+      const bool starving = relief && next == running_ && Clock::now() - running_->running_since > kStarving &&
                             std::any_of(threads_.begin(), threads_.end(), [&](auto& t) {
                               return t.get() != running_ && t->state == Thread::State::Ready;
                             });
@@ -673,8 +676,8 @@ void Kernel::svc(Thread& self, uint32_t number) {
   case 0x08: { // CreateThread(priority, entry, argument, stack, processor) -> handle
     // shortcut: every thread on the application core, the processor id ignored (as Zakuro)
     if (std::getenv("CTRN_LOG_THREADS"))
-      fprintf(stderr, "[kernel] thread entry %08x prio %d arg %08x stack top %08x, created from %08x by a prio %d thread\n",
-              r[1], int(r[0]), r[2], r[3], r[14], self.priority);
+      fprintf(stderr, "[kernel] thread entry %08x prio %d arg %08x stack top %08x core %d, created from %08x by a prio %d thread\n",
+              r[1], int(r[0]), r[2], r[3], int(r[4]), r[14], self.priority);
     auto thread = create_thread(r[1], r[3], r[2], static_cast<int>(r[0]));
     r[0] = kOk, r[1] = add_handle(thread);
     yield();
