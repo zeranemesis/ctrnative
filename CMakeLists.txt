@@ -35,6 +35,9 @@ else ()
     add_custom_command(TARGET ctrnative POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PICANATIVE_DIR}/build/Release/${dll}.dll" "$<TARGET_FILE_DIR:ctrnative>")
   endforeach ()
+  # the shader translator tools/ctrn.py runs when it builds a game
+  add_custom_command(TARGET ctrnative POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PICANATIVE_DIR}/build/Release/pn_shaders.exe" "$<TARGET_FILE_DIR:ctrnative>")
 endif ()
 target_include_directories(ctrnative PRIVATE "${RECOMP_DIR}" "${PICANATIVE_DIR}/include")
 if (MSVC)

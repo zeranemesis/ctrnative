@@ -52,6 +52,15 @@ minutes) ; le module est gardé en cache (`%LOCALAPPDATA%\ctrnative`), par
 identifiant du jeu et empreinte de son code. Les sauvegardes vont dans
 `<cache>/user`.
 
+Les shaders du jeu sont traduits à ce moment-là aussi : le lanceur cherche les
+binaires de shaders (blocs DVLB) dans le code et dans chaque fichier de la
+RomFS, tel quel ou décompressé (LZ10/LZ11, Yaz0, LzS), les garde dans
+`<cache>/games/<jeu>/shaders/`, et `pn_shaders` (picanative, copié à côté de
+l'hôte) les traduit dans `shaders.pnvs`, que l'hôte charge au démarrage. En fin
+de partie, l'hôte dit combien de programmes étaient traduits à l'avance et
+combien l'ont été pendant la partie (chacun est aussi journalisé) ; le but est
+zéro. La traduction est refaite quand picanative change.
+
 L'hôte se lance aussi seul : `build/ctrnative <module> jeu.3ds` (il lit le
 code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 

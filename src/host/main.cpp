@@ -14,6 +14,7 @@
 #include "y2r.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -102,6 +103,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
   SetUnhandledExceptionFilter(report_crash);
 #endif
+  const auto started = std::chrono::steady_clock::now();
   if (argc != 3 && argc != 4) {
     std::fprintf(stderr, "usage: ctrnative <module> <rom.3ds>\n       ctrnative <module> <code.bin> <exheader.bin>  (with CTRN_ROM for the RomFS)\n");
     return 2;
@@ -175,6 +177,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "picanative: %s\n", message);
     return 2;
   }
+  // the game's GPU programs, translated when its module was built (tools/ctrn.py), beside the module
+  const std::string translated = (std::filesystem::path(argv[1]).parent_path() / "shaders.pnvs").string();
+  if (!pn_load_shaders(engine, translated.c_str(), message, sizeof message))
+    std::printf("[host] no shaders translated ahead (%s: %s)\n", translated.c_str(), message);
   // the internal resolution: CTRN_SCALE times the console's (2 by default, 1 = the console's pixels)
   const char* scale_env = std::getenv("CTRN_SCALE");
   pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 2);
@@ -244,6 +250,7 @@ int main(int argc, char** argv) {
   const char* frames_env = std::getenv("CTRN_FRAMES");
   const uint64_t limit = frames_env ? std::strtoull(frames_env, nullptr, 10) : 0;
   uint32_t last_top = 0, pictures = 0;
+  bool shown = false; // the first picture, for the start time
   // CTRN_SHOT_EVERY=n: the top screen every n frames into CTRN_SHOT_DIR (default .), f<frame>.ppm
   const char* shot_env = std::getenv("CTRN_SHOT_EVERY");
   const uint64_t shot_every = shot_env ? std::strtoull(shot_env, nullptr, 10) : 0;
@@ -267,6 +274,10 @@ int main(int argc, char** argv) {
       const auto screens = gsp.screens();
       if (window) pn_window_present(window, screens.data());
       // the game's frame rate: a new top-screen picture is a frame it finished
+      if (screens[0].address != last_top && !shown)
+        shown = true, std::printf("[host] first picture after %.2f s (frame %llu)\n",
+                                  std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                                  static_cast<unsigned long long>(frames));
       pictures += screens[0].address != last_top;
       last_top = screens[0].address;
       if (shot_every && frames % shot_every == 0) {
@@ -325,6 +336,13 @@ int main(int argc, char** argv) {
       std::printf("[host]   display transfer %08x -> %08x flags %08x: %llu times, %.2f s\n", kind[0], kind[1], kind[2],
                   static_cast<unsigned long long>(use.first), use.second);
   }
+  uint64_t programs[3];
+  double times[7];
+  pn_shader_stats(engine, programs);
+  pn_times(engine, times);
+  std::printf("[host] vertex programs: %llu translated ahead, %llu translated during the game (%.1f ms); "
+              "pipelines %.1f s\n", static_cast<unsigned long long>(programs[0]),
+              static_cast<unsigned long long>(programs[1]), programs[2] / 1000.0, times[2]);
   std::printf("[host] stopped after %llu frames: %s\n", static_cast<unsigned long long>(frames), why.c_str());
   std::fflush(stdout);
   module.finish();
