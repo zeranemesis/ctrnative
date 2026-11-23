@@ -592,6 +592,11 @@ void Kernel::svc(Thread& self, uint32_t number) {
   case 0x01: { // ControlMemory(op, addr0, addr1, size, perm) -> address
     const uint32_t op = r[0] & 0xFF, addr0 = r[1], addr1 = r[2], size = r[3];
     const bool linear = r[0] & 0x10000;
+    // CTRN_LOG_MEMORY=1: each request, to see a game's heaps take shape
+    static const bool log_memory = std::getenv("CTRN_LOG_MEMORY") != nullptr;
+    if (log_memory)
+      std::printf("[kernel] ControlMemory op %x%s %08x %08x size %x (from %08x)\n", op, linear ? " linear" : "", addr0, addr1,
+                  size, r[14]);
     if (size & 0xFFF) {
       r[0] = kMisalignedSize;
       break;
@@ -599,6 +604,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     if (op == 3 && linear) {
       const uint32_t physical = allocate(kApplication, size, false);
       if (!physical) {
+        std::printf("[kernel] ControlMemory: no %x contiguous bytes left for the linear heap\n", size);
         r[0] = kOutOfMemory;
         break;
       }
@@ -609,6 +615,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
       // the heap: physically contiguous from the top, not zeroed (as Zakuro)
       const uint32_t base = addr0 ? addr0 : heap_top_, physical = allocate(kApplication, size, true);
       if (!physical) {
+        std::printf("[kernel] ControlMemory: no %x bytes left for the heap\n", size); // the game may go on without
         r[0] = kOutOfMemory;
         break;
       }
