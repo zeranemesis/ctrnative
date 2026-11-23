@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
 
   host::Kernel kernel(memory, module);
   if (host::trace::on()) host::trace::start(module);
-  host::GfxNatives gfx_natives(kernel);
+  host::GfxNatives gfx_natives(kernel, engine);
   kernel.set_natives([&](host::Thread& thread, uint32_t which) { return gfx_natives.call(thread, which); });
   host::Services services;
   services.module = &module;
