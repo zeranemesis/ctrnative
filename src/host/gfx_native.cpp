@@ -464,8 +464,15 @@ uint32_t GfxNatives::translated(uint32_t address, uint32_t size) {
 bool GfxNatives::list_copy(uint32_t destination, uint32_t source, uint32_t size) {
   // a block copied where the game's next command goes: its mark, then a padding picanative skips, as long as the
   // block (the caller moves on by its size)
+  if (size < 8 || (size & 7)) {
+    ++refused_copies_[size];
+    return false;
+  }
   const uint32_t operation = translated(source, size);
-  if (!operation) return false;
+  if (!operation) {
+    ++refused_copies_[size | 0x80000000u]; // not a block of its own (a jump in it, or not commands)
+    return false;
+  }
   Memory& m = kernel_.memory();
   uint32_t at = mark_at(destination, operation), left = size / 4 - 2;
   while (left) {
@@ -793,6 +800,9 @@ void GfxNatives::report() const {
     std::printf("[gfx] %s: %llu calls, %llu done natively\n", name(which), static_cast<unsigned long long>(n),
                 static_cast<unsigned long long>(done == done_.end() ? 0 : done->second));
   }
+  for (const auto& [size, n] : refused_copies_)
+    std::printf("[gfx] copy into the list left to the game: %u bytes%s, %llu times\n", size & 0x7FFFFFFF,
+                size >> 31 ? " (not translatable)" : "", static_cast<unsigned long long>(n));
   if (copied_words_)
     std::printf("[gfx] blocks copied into lists: %llu words, as marks\n", static_cast<unsigned long long>(copied_words_));
   if (uncopied_words_)

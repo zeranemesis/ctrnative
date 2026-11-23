@@ -454,8 +454,7 @@ def natives_source(found, cursor=None):
                 continue
             out.append(f"/* {what} */\n"
                        f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
-                       f"    if (ctx->r[0] == mem_read32_in(FASTMEM(ctx), 0x{cursor:08X}u) && ctx->r[2] >= 16 &&\n"
-                       f"        !(ctx->r[2] & 7)) {{\n"
+                       f"    if (ctx->r[0] == mem_read32_in(FASTMEM(ctx), 0x{cursor:08X}u)) {{\n"
                        f"        ctx->r[12] = {number}u;\n"
                        f"        SVC(0x{address:08X}u, 0xF0u);\n"
                        f"        if (ctx->r[12] != 0) RETURN_TO(ctx->r[14]);\n"

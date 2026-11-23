@@ -126,6 +126,7 @@ private:
     uint32_t id = 0, generation = 0;
   };
   std::map<std::pair<uint32_t, uint32_t>, Translated> translated_;
+  std::map<uint32_t, uint64_t> refused_copies_; // by size (bit 31: not translatable)
   uint64_t uncopied_words_ = 0, translated_words_ = 0, copied_words_ = 0;
 };
 
