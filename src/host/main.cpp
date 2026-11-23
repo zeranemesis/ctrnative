@@ -107,6 +107,7 @@ struct {
   void* page[2] = {};
   int hit = -1; // the view the step under way writes through
   const host::Kernel* kernel = nullptr;
+  const host::Module* module = nullptr;
   uint32_t guest = 0, before = 0;
   bool ours = false;
 } g_watch;
@@ -131,9 +132,10 @@ LONG WINAPI watch_writes(EXCEPTION_POINTERS* e) {
                              static_cast<LPCSTR>(r.ExceptionAddress), &module))
         GetModuleFileNameA(module, name, sizeof name);
       const char* base = std::strrchr(name, '\\');
-      std::fprintf(stderr, "[watch] %08x written by %s+0x%llx, guest code last entered %08x", g_watch.guest,
-                   base ? base + 1 : name,
+      std::fprintf(stderr, "[watch] %08x written by %s+0x%llx (guest function %08x), guest code last entered %08x",
+                   g_watch.guest, base ? base + 1 : name,
                    static_cast<unsigned long long>(static_cast<char*>(r.ExceptionAddress) - reinterpret_cast<char*>(module)),
+                   g_watch.module ? g_watch.module->guest_function(r.ExceptionAddress) : 0,
                    g_watch.kernel ? g_watch.kernel->running_pc() : 0);
     }
     VirtualProtect(g_watch.page[view], 0x1000, PAGE_READWRITE, &old);
@@ -340,7 +342,7 @@ int main(int argc, char** argv) {
   const host::TestInput test_input;
 #if defined(_WIN32)
   static const char* watch_env = std::getenv("CTRN_WATCH_WRITE");
-  if (watch_env) AddVectoredExceptionHandler(1, watch_writes), g_watch.kernel = &kernel;
+  if (watch_env) AddVectoredExceptionHandler(1, watch_writes), g_watch.kernel = &kernel, g_watch.module = &module;
 #endif
   while (!kernel.stopped()) {
 #if defined(_WIN32)

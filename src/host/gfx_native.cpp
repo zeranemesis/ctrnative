@@ -225,6 +225,7 @@ bool GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
     const uint32_t reg = header & 0xFFFF, mask = header >> 16 & 0xF, extra = header >> 20 & 0xFF;
     const bool consecutive = header >> 31;
     if (reg >= 0x300) break; // the list is over
+    if (i + 2 + extra > bytes / 4) return false; // a command running past the block: not a block of commands
     if (reg == 0x2F1) { // a padding of ours, where a block was: nothing
       i += 2 + extra;
       i += i & 1;
