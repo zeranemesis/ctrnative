@@ -14,7 +14,7 @@ if (NOT EXISTS "${RECOMP_DIR}/recomp.h")
 endif ()
 
 set(HOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/host")
-set(HOST_SOURCES main.cpp input.cpp kernel.cpp memory.cpp module.cpp services.cpp gsp.cpp dsp.cpp native.cpp)
+set(HOST_SOURCES main.cpp input.cpp rom.cpp kernel.cpp memory.cpp module.cpp services.cpp gsp.cpp dsp.cpp native.cpp)
 list(TRANSFORM HOST_SOURCES PREPEND "${HOST_DIR}/")
 if (ANDROID)
   # libmain.so, which SDL's activity loads; the engine and SDL3 from picanative's Android build

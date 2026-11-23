@@ -28,32 +28,34 @@ un deuxième jeu, voir [docs/PLAN.md](docs/PLAN.md).
 
 ## Construire
 
-Il faut clang-cl (LLVM), CMake et Ninja, et picanative construit à côté
-(`../picanative`, voir son README).
+Il faut clang et clang-cl (LLVM), CMake, Ninja, Python 3,
+[3dsrecomp](https://github.com/fearkov/3dsrecomp) compilé, et picanative
+construit à côté (`../picanative`, voir son README).
 
 ```bash
-# le module du jeu : 3dsrecomp traduit son code en C, clang le compile (quelques minutes)
-3dsrecomp generate jeu.3ds build/games/jeu/recomp
-python tools/build_module.py build/games/jeu/recomp build/games/jeu/module.dll
-# l'hôte (recomp.h, commun à tous les jeux, vient de n'importe quelle traduction)
+# l'hôte ; recomp.h, le même pour tous les jeux, est dans abi/ de 3dsrecomp
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRECOMP_DIR=build/games/jeu/recomp
+  -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRECOMP_DIR=<3dsrecomp>/abi
 cmake --build build
 ```
 
-Le code et l'exheader du jeu (`code.bin`, `exheader.bin`) s'extraient de la
-ROM avec [ctrtool](https://github.com/3DSGuy/Project_CTR) ; le lanceur le fera
-(étape 3).
-
-## Lancer
+## Lancer un jeu
 
 ```bash
-CTRN_ROM=jeu.3ds build/ctrnative.exe <module du jeu> <code.bin> <exheader.bin>
+python tools/ctrn.py jeu.3ds --3dsrecomp <3dsrecomp.exe>
 ```
+
+La ROM doit être décryptée (.3ds/.cci, ou .cxi). Au premier lancement, le
+lanceur traduit le code du jeu avec 3dsrecomp et le compile (quelques
+minutes) ; le module est gardé en cache (`%LOCALAPPDATA%\ctrnative`), par
+identifiant du jeu et empreinte de son code. Les sauvegardes vont dans
+`<cache>/user`.
+
+L'hôte se lance aussi seul : `build/ctrnative <module> jeu.3ds` (il lit le
+code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 
 | Variable | Effet |
 |---|---|
-| `CTRN_ROM` | la ROM décryptée (.3ds) : sa RomFS et son ExeFS |
 | `CTRN_USER_DIR` | le dossier des sauvegardes |
 | `CTRN_HEADLESS=1`, `CTRN_FRAMES=n` | sans fenêtre, arrêt après n images |
 | `CTRN_SCALE` | résolution interne (2 par défaut) |

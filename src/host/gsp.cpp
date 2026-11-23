@@ -267,6 +267,23 @@ bool Gsp::handle(Thread& thread, uint32_t* c) {
   case 0x0015:                                         // TryAcquireRight
   case 0x0016:                                         // AcquireRight
   case 0x0017: reply(); return true;                   // ReleaseRight
+  case 0x0018: { // ImportDisplayCaptureInfo -> per screen: left and right framebuffers, format, stride
+    // the screens' registers hold physical addresses; the game wants its own: VRAM at 0x1F000000,
+    // FCRAM at the linear heap's 0x14000000
+    auto virtual_of = [](uint32_t p) {
+      if (p >= 0x18000000 && p < 0x18600000) return p - 0x18000000 + 0x1F000000;
+      if (p >= 0x20000000 && p < 0x28000000) return p - 0x20000000 + 0x14000000;
+      return p;
+    };
+    const auto s = screens();
+    c[0] = header(id, 9, 0), c[1] = kOk;
+    for (int i = 0; i < 2; ++i) {
+      const uint32_t address = virtual_of(s[i].address);
+      c[2 + 4 * i] = address, c[3 + 4 * i] = address; // no 3D: the right eye's is the left's
+      c[4 + 4 * i] = s[i].format, c[5 + 4 * i] = s[i].stride;
+    }
+    return true;
+  }
   default: return false;
   }
 }

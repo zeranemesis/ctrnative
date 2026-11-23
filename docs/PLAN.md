@@ -14,9 +14,10 @@ Les étapes le rendent valable pour tous les jeux.
    ouverture, dossiers lus pour de vrai), la manette et l'écran tactile écrits
    à chaque image dans la mémoire partagée de HID. Contrôle : SM3DL, module
    généré sans aucun remplacement, va de l'introduction à la carte du monde 1.
-3. **Le lanceur.** Une ROM décryptée en entrée : extraction de l'ExeFS, de
-   l'exheader et de la RomFS, 3dsrecomp, compilation du module, cache par
-   identifiant du jeu et empreinte du code, lancement.
+3. **Le lanceur** — fait. `tools/ctrn.py jeu.3ds` : 3dsrecomp, compilation
+   du module, cache par identifiant du jeu et empreinte de son code, puis
+   lancement. L'hôte lit lui-même la ROM : le code (décompressé), l'exheader,
+   le titre (icône SMDH) et la RomFS.
 4. **Les mods, au format de Luma3DS.**
    - `luma/titles/<id>/romfs/` : les fichiers remplacent ceux de la RomFS
      (LayeredFS), sans reconstruire.

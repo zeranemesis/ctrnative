@@ -1,6 +1,6 @@
 // The port's native host: the recompiled game on our own kernel and services,
 // drawn by picanative in its SDL3 window, no emulator.
-// usage: ctrnative <module> <exefs code.bin> <exheader>
+// usage: ctrnative <module> <rom.3ds>  (or <module> <code.bin> <exheader.bin>)
 // CTRN_HEADLESS=1: no window; CTRN_FRAMES=n: stop after n frames.
 #include "dsp.hpp"
 #include "gsp.hpp"
@@ -8,6 +8,7 @@
 #include "memory.hpp"
 #include "module.hpp"
 #include "native.hpp"
+#include "rom.hpp"
 #include "input.hpp"
 #include "services.hpp"
 
@@ -98,14 +99,38 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
   SetUnhandledExceptionFilter(report_crash);
 #endif
-  if (argc != 4) {
-    std::fprintf(stderr, "usage: ctrnative <module> <code.bin> <exheader.bin>\n");
+  if (argc != 3 && argc != 4) {
+    std::fprintf(stderr, "usage: ctrnative <module> <rom.3ds>\n       ctrnative <module> <code.bin> <exheader.bin>  (with CTRN_ROM for the RomFS)\n");
     return 2;
   }
-  const std::vector<uint8_t> code = read_file(argv[2]), exheader = read_file(argv[3]);
+  // the game: a decrypted ROM, or its code and exheader already extracted
+  host::Rom rom;
+  std::string rom_error;
+  if (argc == 3) {
+    if (!rom.load(argv[2], rom_error)) {
+      std::fprintf(stderr, "%s: %s\n", argv[2], rom_error.c_str());
+      return 2;
+    }
+#if defined(_WIN32)
+    _putenv_s("CTRN_ROM", argv[2]); // the services read the RomFS from it
+#else
+    setenv("CTRN_ROM", argv[2], 1);
+#endif
+  } else {
+    rom.code = read_file(argv[2]), rom.exheader = read_file(argv[3]);
+    if (rom.exheader.size() >= 8)
+      rom.title.assign(reinterpret_cast<const char*>(rom.exheader.data()), strnlen(reinterpret_cast<const char*>(rom.exheader.data()), 8));
+  }
+  const std::vector<uint8_t>& code = rom.code;
+  const std::vector<uint8_t>& exheader = rom.exheader;
   if (code.empty() || exheader.size() < 0x400) {
     std::fprintf(stderr, "cannot read the code or the exheader\n");
     return 2;
+  }
+  {
+    uint64_t hash = 14695981039346656037ull; // FNV-1a: which code this is, to compare runs
+    for (uint8_t b : code) hash = (hash ^ b) * 1099511628211ull;
+    std::printf("[host] %s: code %zu bytes, fnv %016llx\n", rom.title.c_str(), code.size(), static_cast<unsigned long long>(hash));
   }
   // the exheader's code set: .text, .rodata, .data (address, pages, size), stack, bss
   host::Kernel::Image image{};
@@ -119,8 +144,7 @@ int main(int argc, char** argv) {
   image.priority = exheader[0x20F];
   // shortcut: old-3DS system mode 0 (64 MiB for the application); decode 0x20E's high nibble for games that ask more
   image.app_memory = 64u << 20;
-  // the window's title: the exheader's application title (8 bytes, zero-padded)
-  const std::string title(reinterpret_cast<const char*>(exheader.data()), strnlen(reinterpret_cast<const char*>(exheader.data()), 8));
+  const std::string& title = rom.title;
 
   host::Memory memory;
   host::Module module;
