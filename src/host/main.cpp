@@ -11,6 +11,7 @@
 #include "rom.hpp"
 #include "input.hpp"
 #include "services.hpp"
+#include "y2r.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -68,7 +69,9 @@ void save_screen(pn_engine* engine, host::Memory& memory, const pn_screen& s, co
   // the engine's draw count so far: a run that draws nothing is stuck, whatever the picture
   uint64_t st[3];
   pn_stats(engine, st);
-  std::printf("[host] shot %s: draws %llu\n", path.c_str(), static_cast<unsigned long long>(st[0]));
+  std::printf("[host] shot %s: draws %llu, pipelines %llu, shader errors %llu, framebuffer %08x format %u stride %u\n",
+              path.c_str(), static_cast<unsigned long long>(st[0]), static_cast<unsigned long long>(st[1]),
+              static_cast<unsigned long long>(st[2]), s.address, s.format, stride);
   std::ofstream out(path, std::ios::binary);
   out << "P6\n" << w << " " << h << "\n255\n";
   out.write(reinterpret_cast<const char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
@@ -142,8 +145,15 @@ int main(int argc, char** argv) {
   image.data_address = u32(exheader, 0x30), image.data_pages = u32(exheader, 0x34), image.data_size = u32(exheader, 0x38);
   image.bss_size = u32(exheader, 0x3C);
   image.priority = exheader[0x20F];
-  // shortcut: old-3DS system mode 0 (64 MiB for the application); decode 0x20E's high nibble for games that ask more
-  image.app_memory = 64u << 20;
+  // the application's memory by the old 3DS's system mode, flag 0's high nibble: 0 prod 64 MiB, 2 dev1 96 MiB,
+  // 3 dev2 80 MiB, 4 dev3 72 MiB, 5 dev4 32 MiB
+  switch (exheader[0x20E] >> 4) {
+  case 2: image.app_memory = 96u << 20; break;
+  case 3: image.app_memory = 80u << 20; break;
+  case 4: image.app_memory = 72u << 20; break;
+  case 5: image.app_memory = 32u << 20; break;
+  default: image.app_memory = 64u << 20; break;
+  }
   const std::string& title = rom.title;
 
   host::Memory memory;
@@ -184,14 +194,17 @@ int main(int argc, char** argv) {
 
   host::Kernel kernel(memory, module);
   host::Services services;
+  services.module = &module;
   services.program_id = uint64_t{u32(exheader, 0x200)} | uint64_t{u32(exheader, 0x204)} << 32;
   host::Gsp gsp(kernel, engine);
   host::Dsp dsp(kernel);
+  host::Y2r y2r;
   host::native = {&kernel, &gsp, &dsp, &services}; // the native API the platform layer calls
   kernel.set_services([&](host::Kernel& k, host::Thread& t, const std::string& name, uint32_t* command) {
     if (name == "gsp::Gpu") return gsp.handle(t, command);
     if (name == "dsp::DSP") return dsp.handle(t, command);
-    return services.handle(k, t, name, command);
+    if (name == "y2r:u") return y2r.handle(k, command);
+    return services.handle(k, t, name, command) || services.answer_neutrally(name, command);
   });
   kernel.load(image);
   std::printf("[host] %u recompiled entries; running natively (no emulator, no interpreter)\n", module.entry_count());
@@ -236,6 +249,7 @@ int main(int argc, char** argv) {
   const uint64_t shot_every = shot_env ? std::strtoull(shot_env, nullptr, 10) : 0;
   const std::string shot_dir = std::getenv("CTRN_SHOT_DIR") ? std::getenv("CTRN_SHOT_DIR") : ".";
   auto rate_since = std::chrono::steady_clock::now();
+  double idle_at = 0, engine_at = 0;
   const host::TestInput test_input;
   while (!kernel.stopped()) {
     pn_input input{};
@@ -264,10 +278,34 @@ int main(int argc, char** argv) {
       }
     }
     if (const auto now = std::chrono::steady_clock::now(); now - rate_since >= std::chrono::seconds(10)) {
-      std::printf("[host] %.1f images/s (top screen, last 10 s)\n",
-                  pictures / std::chrono::duration<double>(now - rate_since).count());
+      const double seconds = std::chrono::duration<double>(now - rate_since).count();
+      double idle, engine;
+      {
+        auto lock = kernel.lock();
+        idle = kernel.idle_seconds(), engine = gsp.engine_seconds;
+      }
+      // busy near 100 %: the host's CPU is what limits the game; lower, the game waits on the console's pace.
+      // of it, the GPU's share (picanative, inside the game's requests) and the rest, the game's own code
+      const double busy = 1.0 - (idle - idle_at) / seconds, gpu = (engine - engine_at) / seconds;
+      std::printf("[host] %.1f images/s (top screen, last 10 s), busy %.0f %% (GPU %.0f %%, game code %.0f %%)\n",
+                  pictures / seconds, 100 * busy, 100 * gpu, 100 * (busy - gpu));
+      // CTRN_PEEK=address[,address...]: 16 bytes of the game's memory at each, for diagnosis
+      for (const char* p = std::getenv("CTRN_PEEK"); p && *p;) {
+        char* end;
+        const uint32_t address = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+        if (end == p) break;
+        uint8_t bytes[16] = {};
+        {
+          auto lock = kernel.lock();
+          memory.read(address, bytes, sizeof bytes);
+        }
+        std::printf("[host] peek %08x:", address);
+        for (uint8_t b : bytes) std::printf(" %02x", b);
+        std::printf("\n");
+        p = *end == ',' ? end + 1 : end;
+      }
       std::fflush(stdout);
-      pictures = 0, rate_since = now;
+      pictures = 0, rate_since = now, idle_at = idle, engine_at = engine;
     }
     if (limit && ++frames >= limit) kernel.stop("frame limit reached");
     next += period;
@@ -277,7 +315,16 @@ int main(int argc, char** argv) {
   }
   const std::string why = kernel.wait();
   audio.join();
-  if (std::getenv("CTRN_SVC_STATS")) kernel.report();
+  if (std::getenv("CTRN_SVC_STATS")) {
+    kernel.report();
+    const double* k = gsp.kind_seconds;
+    std::printf("[host] GPU time: command lists %.1f s, FlushDataCache %.1f s, InvalidateDataCache %.1f s, "
+                "fills %.1f s, display transfers %.1f s, texture copies %.1f s, refreshes %.1f s\n", k[0], k[1], k[2],
+                k[3], k[5], k[6], k[4]);
+    for (const auto& [kind, use] : gsp.transfer_kinds)
+      std::printf("[host]   display transfer %08x -> %08x flags %08x: %llu times, %.2f s\n", kind[0], kind[1], kind[2],
+                  static_cast<unsigned long long>(use.first), use.second);
+  }
   std::printf("[host] stopped after %llu frames: %s\n", static_cast<unsigned long long>(frames), why.c_str());
   std::fflush(stdout);
   module.finish();

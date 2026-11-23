@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace host {
 
@@ -16,9 +17,11 @@ public:
   bool load(const std::string& path, const uint8_t* code, uint32_t base, uint32_t size, std::string& error);
   ~Module();
 
-  // the recompiled code for an address (bit 0 set for Thumb), or null
+  // the recompiled code for an address (bit 0 set for Thumb), in the executable or a placed CRO module, or null
   Code lookup(uint32_t address) const;
   uint32_t entry_count() const { return count_; }
+  // a CRO module ldr:ro loaded at base (0: unloaded): its translated code runs there; false when there is none
+  bool place(const std::string& name, uint32_t base);
   // what the module wants done before the process ends (a coverage build
   // writes its counts), as the host leaves with _Exit and no atexit runs
   void finish() const { if (finish_) finish_(); }
@@ -28,6 +31,13 @@ private:
   void (*finish_)() = nullptr;
   const Entry* entries_ = nullptr;
   uint32_t count_ = 0;
+  const ::Module* modules_ = nullptr; // the CRO modules' code, by name (3dsrecomp's recomp_modules)
+  uint32_t module_count_ = 0;
+  struct Placed {
+    uint32_t base, size;
+    const ::Module* module;
+  };
+  std::vector<Placed> placed_;
 };
 
 } // namespace host

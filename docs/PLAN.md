@@ -121,6 +121,41 @@ l'empaquetage). Essai : la campagne B courte sur l'AYN Thor.
 Des versions publiées (l'hôte compilé, le lanceur), avec ce qu'il faut pour
 traduire un jeu chez soi (3dsrecomp, clang) ou une façon de s'en passer.
 
+## Principe : aucune émulation
+
+Décision du 2026-11-23 : rien ne doit être émulé. Le code du jeu l'est déjà
+(traduit à l'avance, exécuté en natif) ; le système (fichiers, son, threads)
+est une couche de compatibilité, comme Wine. Restent à supprimer :
+
+1. **La mémoire de la 3DS** derrière une table de pages consultée à chaque
+   accès : la mémoire du jeu placée telle quelle dans 4 Gio réservés du PC,
+   un accès = une addition à une base.
+2. **Les shaders du GPU** traduits pendant la partie : traduits à l'avance,
+   avec le reste du jeu.
+3. **Les listes de commandes PICA200** que le jeu fabrique et que picanative
+   relit : la bibliothèque graphique du SDK que chaque jeu embarque remplacée
+   par une version native, bibliothèque par bibliothèque. picanative ne sert
+   plus qu'aux jeux dont la bibliothèque n'est pas encore faite, puis à aucun.
+
+## Phase H — Mieux que la console, pour tous les jeux
+
+Une fois les jeux fonctionnels, des améliorations du moteur, donc valables pour
+chaque jeu sans travail propre à l'un d'eux :
+
+- **les performances du logiciel** : le temps par image (GPU, code du jeu,
+  transferts) mesuré par jeu (A3), puis réduit là où il se perd ; la première
+  traduction plus courte (niveau d'optimisation, indices fournis par jeu) ;
+- **la fluidité** : 60 images/s pour les jeux qui tournent à 30 sur la console,
+  quand c'est possible sans changer leur logique ;
+- **la qualité d'image** : la résolution interne (déjà là, `CTRN_SCALE`), le
+  filtrage des textures, l'anticrénelage, l'écran large ;
+- **les mods** : la gestion de ceux de la phase C (choix, ordre, activation par
+  jeu) ;
+- et ce qui s'y ajoutera.
+
+Chaque amélioration se vérifie sur les jeux de la campagne, comparée à
+l'image sans elle.
+
 ## Ordre
 
 A, puis B en entier, avant C et D : tant que SM3DL n'est pas vérifié jusqu'au

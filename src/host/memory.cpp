@@ -68,4 +68,15 @@ void Memory::write(uint32_t address, const void* from, uint32_t size) {
     if (uint8_t* page = writes_[(address + i) >> 12]) page[(address + i) & 0xFFF] = in[i];
 }
 
+bool Memory::write_any(uint32_t address, const void* from, uint32_t size) {
+  const auto* in = static_cast<const uint8_t*>(from);
+  bool all = true;
+  for (uint32_t i = 0; i < size; ++i) {
+    uint8_t* page = reads_[(address + i) >> 12]; // the same bytes, whatever the page's permission
+    if (page) page[(address + i) & 0xFFF] = in[i];
+    else all = false;
+  }
+  return all;
+}
+
 } // namespace host

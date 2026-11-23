@@ -37,6 +37,13 @@ TestInput::TestInput() {
     for (std::string w; words >> w;) {
       if (w.rfind("x=", 0) == 0) { s.x = std::strtof(w.c_str() + 2, nullptr); continue; }
       if (w.rfind("y=", 0) == 0) { s.y = std::strtof(w.c_str() + 2, nullptr); continue; }
+      if (w.rfind("touch=", 0) == 0) {
+        unsigned tx = 0, ty = 0;
+        s.touch = std::sscanf(w.c_str() + 6, "%u,%u", &tx, &ty) == 2 && tx < 320 && ty < 240;
+        if (!s.touch) std::fprintf(stderr, "[input] a touch off the bottom screen: %s\n", w.c_str());
+        s.touch_x = static_cast<uint16_t>(tx), s.touch_y = static_cast<uint16_t>(ty);
+        continue;
+      }
       bool known = false;
       for (const auto& n : names)
         if (w == n.name) s.buttons |= n.bit, known = true;
@@ -52,7 +59,10 @@ void TestInput::apply(uint64_t frame, Services::Input& input) const {
   if (press_a_ && beat) input.buttons |= 1u;
   if (tap_ && beat && !input.touching) input.touching = true, input.touch_x = tap_x_, input.touch_y = tap_y_;
   for (const Step& s : script_)
-    if (frame >= s.from && frame < s.to) input.buttons |= s.buttons, input.circle_x += s.x, input.circle_y += s.y;
+    if (frame >= s.from && frame < s.to) {
+      input.buttons |= s.buttons, input.circle_x += s.x, input.circle_y += s.y;
+      if (s.touch) input.touching = true, input.touch_x = s.touch_x, input.touch_y = s.touch_y;
+    }
 }
 
 } // namespace host

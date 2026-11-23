@@ -65,7 +65,26 @@ code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 | `CTRN_PRESS_A=1`, `CTRN_TAP_AT=x,y` | essais sans joueur : A, ou un toucher, 6 images sur 60 |
 | `CTRN_INPUT_SCRIPT` | essais : lignes `début fin TOUCHES… [x=..] [y=..]`, en images |
 | `CTRN_LOG_THREADS=1` | chaque thread créé, avec sa priorité et sa pile |
+| `CTRN_LOG_IPC=1` | chaque requête aux services, au fil de la partie (sauf GPU, DSP, fichiers) |
+| `CTRN_SVC_STATS=1` | en fin de partie : appels système, requêtes, et ce que chaque thread attend |
+| `CTRN_STRICT=1` | pas de réponse par défaut des services périphériques : arrêt au premier manquant |
 | `CTRN_UNCACHED=1` | le moteur relit chaque surface (lent, pour comparer) |
+
+Toutes les 10 s, l'hôte affiche les images/s du jeu et la part du temps où son
+code travaillait : près de 100 %, c'est le processeur du PC qui limite ; plus
+bas, le jeu attend le rythme de la console (il n'y a rien à gagner côté CPU).
+
+Les services périphériques pas encore écrits (réseau, amis, StreetPass,
+contenus téléchargeables…) répondent « succès, rien à signaler », comme une
+console hors ligne, et le journal le dit une fois par commande. Les applets
+(clavier, sélecteur de Mii, messages d'erreur) se ferment aussitôt avec la
+réponse d'un joueur qui valide : un nom « Player », un Mii standard.
+
+Le lanceur trouve dans le code ce que 3dsrecomp ne voit pas : les
+constructeurs C++, les tables de sauts et les appels écrits à la main en
+assembleur (décodeurs vidéo). Il faut un 3dsrecomp où un indice donné par
+`--hints` devient toujours une entrée, même au milieu d'une fonction déjà
+trouvée ou à la place d'une fausse fonction Thumb (`apply_hints`, build.rs).
 
 ## Remerciements
 

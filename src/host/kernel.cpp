@@ -142,6 +142,12 @@ uint32_t Kernel::allocate(int index, uint32_t size, bool top) {
   return 0;
 }
 
+void Kernel::release(uint32_t physical, uint32_t size) {
+  for (auto& region : regions_)
+    for (uint32_t a = physical; a < physical + size; a += 0x1000)
+      if (a >= region.base && a < region.base + region.size) region.used[(a - region.base) / 0x1000] = false;
+}
+
 void Kernel::load(const Image& image) {
   // FCRAM: the application's, the system's (up to 32 MiB), the base region
   const uint32_t app = image.app_memory, system = std::min(Memory::kFcramSize - app, 32u << 20);
@@ -170,8 +176,11 @@ void Kernel::load(const Image& image) {
     std::memset(memory_.physical(physical, bytes), 0, bytes);
     memory_.map(bss_start, physical, bytes, true);
   }
+  // the code's extent, as QueryMemory tells it
+  code_ = {image.text_address, image.text_address + image.text_pages * 0x1000, image.ro_address + image.ro_pages * 0x1000,
+           std::max(bss_start, (bss_end + 0xFFF) & ~0xFFFu)};
   // the main thread's stack, ending at 0x10000000
-  const uint32_t stack = (std::max(image.stack_size, 0x4000u) + 0xFFF) & ~0xFFFu;
+  const uint32_t stack =(std::max(image.stack_size, 0x4000u) + 0xFFF) & ~0xFFFu;
   const uint32_t stack_physical = allocate(kApplication, stack, true);
   std::memset(memory_.physical(stack_physical, stack), 0, stack);
   memory_.map(0x10000000 - stack, stack_physical, stack, true);
@@ -290,6 +299,21 @@ void Kernel::report() const {
   std::printf("[host] the game called the 3DS system %llu times (of which %llu service requests):\n",
               (unsigned long long)svcs, (unsigned long long)requests);
   for (auto& [count, line] : lines) std::printf("  %10llu  %s\n", (unsigned long long)count, line.c_str());
+  // who waits on what at the end: a run that stops drawing is usually a thread waiting forever
+  static const char* states[] = {"ready", "running", "sleeping", "wait-sync", "wait-arbiter", "dead"};
+  for (const auto& t : threads_) {
+    if (t->state == Thread::State::Dead) continue;
+    std::printf("[host] thread %u prio %d %s, last dispatch %08x lr %08x", t->id, t->priority,
+                states[static_cast<int>(t->state)], t->last_pc, t->ctx.r[14]);
+    for (const auto& o : t->waiting) {
+      if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port)
+        std::printf(" [%s]", static_cast<const Session&>(*o).name.c_str());
+      else
+        for (const auto& [handle, object] : handles_)
+          if (object == o) std::printf(" [handle %x kind %d]", handle, static_cast<int>(o->kind));
+    }
+    std::printf("\n");
+  }
 }
 
 // ---- scheduling
@@ -385,6 +409,9 @@ Thread* Kernel::pick() {
 void Kernel::hand_to(Thread* next) {
   running_ = next;
   preempt_ = false;
+  // the time no game thread can run: the game waits for the console, not for the host's CPU
+  if (!next && idle_since_ == Clock::time_point{}) idle_since_ = Clock::now();
+  if (next && idle_since_ != Clock::time_point{}) idle_ += Clock::now() - idle_since_, idle_since_ = {};
   if (next) {
     next->state = Thread::State::Running;
     next->baton.notify_one();
@@ -430,11 +457,22 @@ void Kernel::timekeeper() {
       if (next != running_ || starving) preempt_ = true;
     }
     auto deadline = Clock::now() + std::chrono::milliseconds(2); // the starvation check's period
+    bool timed = false; // a game thread's own deadline, not the check's
     for (auto& t : threads_)
-      if (t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
-          t->state == Thread::State::WaitArbiter)
-        deadline = std::min(deadline, t->wake_at);
-    wake_timekeeper_.wait_until(lock, deadline);
+      if ((t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
+           t->state == Thread::State::WaitArbiter) && t->wake_at <= deadline)
+        deadline = t->wake_at, timed = true;
+    // the host's waits wake a millisecond late or more (Windows' timer): a game's short sleeps and the
+    // pauses after its requests (tens of microseconds) would take that long each, its loading crawl;
+    // so the last millisecond before a game's deadline is waited by spinning, the lock let go
+    constexpr auto kSpin = std::chrono::milliseconds(1);
+    if (timed && deadline - Clock::now() <= kSpin) {
+      lock.unlock();
+      while (Clock::now() < deadline && !stopped_) std::this_thread::yield();
+      lock.lock();
+    } else {
+      wake_timekeeper_.wait_until(lock, timed ? deadline - kSpin : deadline);
+    }
   }
 }
 
@@ -617,6 +655,26 @@ void Kernel::svc(Thread& self, uint32_t number) {
     } else {
       r[0] = kInvalidEnum;
     }
+    break;
+  }
+  case 0x02: { // QueryMemory(_, _, address) -> base, size, permission, state, page flags
+    // what the console says of the block of pages around address that share a kind: the game's code
+    // (text RX, read-only data R, data and bss RW, all "Code"), the linear heap ("Continuous", 7), the
+    // main stack ("Locked", 11), other mapped memory ("Private", 5), nothing mapped ("Free", 0)
+    auto kind = [&](uint32_t page) -> uint32_t { // permission | state << 8
+      const uint32_t a = page << 12;
+      if (!memory_.read_pages()[page]) return 0;
+      if (a >= code_.text && a < code_.end) return (a < code_.text_end ? 5 : a < code_.ro_end ? 1 : 3) | 4 << 8;
+      const uint32_t permission = memory_.write_pages()[page] ? 3 : 1;
+      if (a >= linear_base_ && a < linear_base_ + Memory::kFcramSize) return permission | 7 << 8;
+      if (a >= 0x0E000000 && a < 0x10000000) return permission | 11 << 8;
+      return permission | 5 << 8;
+    };
+    const uint32_t page = r[2] >> 12, at = kind(page);
+    uint32_t first = page, last = page;
+    while (first > 0 && kind(first - 1) == at) --first;
+    while (last < 0xFFFFF && kind(last + 1) == at) ++last;
+    r[0] = kOk, r[1] = first << 12, r[2] = (last - first + 1) << 12, r[3] = at & 0xFF, r[4] = at >> 8, r[5] = 0;
     break;
   }
   case 0x03: stop("the game exited"); break;
@@ -920,6 +978,13 @@ void Kernel::svc(Thread& self, uint32_t number) {
       char key[64];
       std::snprintf(key, sizeof key, "%s %04x from %08x", service.c_str(), command[0] >> 16, r[14]);
       ++requests_[key];
+      // CTRN_LOG_IPC=1: every request as it goes (what a game that stops was asking last)
+      // (CTRN_LOG_IPC=all: GPU, DSP and file requests too)
+      static const char* log_ipc = std::getenv("CTRN_LOG_IPC");
+      if (log_ipc && (std::strcmp(log_ipc, "all") == 0 ||
+                      (service != "gsp::Gpu" && service != "dsp::DSP" && service.rfind("FS", 0) != 0)))
+        std::printf("[ipc] %s %08x %08x %08x %08x %08x (thread %u, lr %08x)\n", service.c_str(), command[0], command[1],
+                    command[2], command[3], command[4], self.id, r[14]);
     }
     // the service reads the session's handle in r0 (a file session finds its file by it)
     if (!services_ || !services_(*this, self, service, command)) {
@@ -938,6 +1003,29 @@ void Kernel::svc(Thread& self, uint32_t number) {
       self.state = Thread::State::Sleeping;
       block(self, lock);
     }
+    break;
+  }
+  case 0x2B: { // GetProcessInfo(_, process, type) -> s64
+    uint64_t value;
+    switch (r[2]) {
+    case 0: case 2: { // the memory the process uses (2: its private memory, which is all of it here)
+      uint64_t pages = 0;
+      for (bool used : regions_[kApplication].used) pages += used;
+      value = pages * 0x1000;
+      break;
+    }
+    case 20: value = Memory::kFcram - linear_base_; break; // from a linear address to its physical one, as an offset
+    case 21: value = linear_base_; break;                  // the linear heap's start
+    case 22: value = linear_base_ + regions_[kApplication].size; break; // its end
+    default: {
+      char why[64];
+      std::snprintf(why, sizeof why, "svc 2b (GetProcessInfo) type %u is not native yet", r[2]);
+      stop(why);
+      c.exit = EXIT_UNWIND;
+      return;
+    }
+    }
+    r[0] = kOk, r[1] = static_cast<uint32_t>(value), r[2] = static_cast<uint32_t>(value >> 32);
     break;
   }
   case 0x35: // GetProcessId -> 0x22

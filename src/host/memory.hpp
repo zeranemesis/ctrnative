@@ -41,6 +41,8 @@ public:
   void write32(uint32_t address, uint32_t value);
   void read(uint32_t address, void* to, uint32_t size) const;
   void write(uint32_t address, const void* from, uint32_t size);
+  // as the system writes: read-only pages too (ldr:ro relocating a module's code); unmapped bytes are dropped
+  bool write_any(uint32_t address, const void* from, uint32_t size);
 
 private:
   std::vector<uint8_t> fcram_, vram_, dsp_, axi_;

@@ -144,7 +144,9 @@ public:
   uint64_t ticks() const;
   // physical memory from the process's regions (bottom or top), 0 when out
   uint32_t allocate(int region, uint32_t size, bool top);
+  void release(uint32_t physical, uint32_t size); // pages allocate gave, free again
   enum { kApplication, kSystem, kBase };
+  uint32_t linear_base() const { return linear_base_; } // where FCRAM's start appears in the linear mapping
 
 private:
   friend struct Callbacks;
@@ -188,12 +190,24 @@ private:
   std::map<std::string, uint64_t> requests_;
   std::shared_ptr<Object> process_ = std::make_shared<Simple>(Object::Kind::Process);
   Clock::time_point start_ = Clock::now();
+  Clock::time_point idle_since_{};
+  Clock::duration idle_{};
+
+public:
+  // seconds so far no game thread could run (with the lock): the game waited for the console,
+  // not for the host's CPU; the busy share of a stretch of time is the rest
+  double idle_seconds() const {
+    auto idle = idle_;
+    if (idle_since_ != Clock::time_point{}) idle += Clock::now() - idle_since_;
+    return std::chrono::duration<double>(idle).count();
+  }
 
   // physical memory: the process's regions, page by page
   struct Region {
     uint32_t base, size;
     std::vector<bool> used;
   } regions_[3];
+  struct { uint32_t text, text_end, ro_end, end; } code_{}; // the game's segments, .text first
   uint32_t heap_top_ = 0x08000000;
   uint32_t linear_base_ = 0x14000000;
 };

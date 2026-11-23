@@ -1,5 +1,7 @@
 #include "module.hpp"
 
+#include <algorithm>
+#include <filesystem>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -22,7 +24,9 @@ uint64_t fnv(const uint8_t* bytes, size_t size) {
 
 bool Module::load(const std::string& path, const uint8_t* code, uint32_t base, uint32_t size, std::string& error) {
 #if defined(_WIN32)
-  HMODULE library = LoadLibraryExA(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR refuses a relative path (error 87)
+  const std::string full = std::filesystem::absolute(path).string();
+  HMODULE library = LoadLibraryExA(full.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
   if (!library) {
     error = "cannot load " + path + " (error " + std::to_string(GetLastError()) + ")";
     return false;
@@ -46,7 +50,11 @@ bool Module::load(const std::string& path, const uint8_t* code, uint32_t base, u
     return false;
   }
   count_ = *count;
-  finish_ = reinterpret_cast<void (*)()>(const_cast<void*>(symbol("recomp_finish")));
+  if (const auto* modules = static_cast<const uint32_t*>(symbol("recomp_module_count")); modules && *modules) {
+    modules_ = static_cast<const ::Module*>(symbol("recomp_modules"));
+    module_count_ = modules_ ? *modules : 0;
+  }
+  finish_ =reinterpret_cast<void (*)()>(const_cast<void*>(symbol("recomp_finish")));
   // the module was generated from this very code: every piece's hash matches
   for (uint32_t i = 0; i < origins->piece_count; ++i) {
     const Piece& piece = origins->pieces[i];
@@ -72,14 +80,33 @@ Module::~Module() {
 #endif
 }
 
+namespace {
+
+Code find(const Entry* entries, uint32_t count, uint32_t address) {
+  const Entry* end = entries + count;
+  const Entry* at = std::lower_bound(entries, end, address, [](const Entry& e, uint32_t a) { return e.address < a; });
+  return at != end && at->address == address ? at->code : nullptr;
+}
+
+} // namespace
+
 Code Module::lookup(uint32_t address) const {
-  uint32_t low = 0, high = count_;
-  while (low < high) {
-    const uint32_t mid = low + (high - low) / 2;
-    if (entries_[mid].address < address) low = mid + 1;
-    else high = mid;
+  if (Code code = find(entries_, count_, address)) return code;
+  for (const Placed& p : placed_) // a module's entries are offsets from where it was loaded
+    if (address - p.base < p.size) return find(p.module->entries, p.module->count, address - p.base);
+  return nullptr;
+}
+
+bool Module::place(const std::string& name, uint32_t base) {
+  for (uint32_t i = 0; i < module_count_; ++i) {
+    const ::Module& m = modules_[i];
+    if (name != m.name) continue;
+    *m.base = base; // what the module's code reads on entry
+    std::erase_if(placed_, [&](const Placed& p) { return p.module == &m; });
+    if (base) placed_.push_back({base, m.size, &m});
+    return true;
   }
-  return low < count_ && entries_[low].address == address ? entries_[low].code : nullptr;
+  return false;
 }
 
 } // namespace host

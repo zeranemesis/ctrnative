@@ -8,7 +8,7 @@ Options:
   --host PATH        ctrnative's executable (default: build/ctrnative next to this repository's tools)
   --build-only       translate and compile, do not run
 The game's saves go to CTRN_USER_DIR (default: <cache>/user)."""
-import argparse, hashlib, os, re, shutil, struct, subprocess, sys
+import argparse, hashlib, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -95,22 +95,72 @@ def decompress(data):
 CALL_LOOP = struct.pack("<4I", 0xE5940000, 0xE28FE004, 0xE0800004, 0xE1A0F000)
 
 
+# the same loop in Thumb (older SDKs, NSMB2): ldr r0, [r4] / adds r0, r0, r4 / blx r0 / adds r4, #4 / cmp r4, r5,
+# the bounds each a Thumb "ldr rN, [pc, #i]" then "add rN, pc"
+THUMB_CALL_LOOP = struct.pack("<5H", 0x6820, 0x1900, 0x4780, 0x1D24, 0x42AC)
+
+
 def constructor_hints(code, base):
     """the C++ constructors the game runs at start: 3dsrecomp finds no call or pointer to them"""
-    at = code.find(CALL_LOOP)
-    if at < 0 or at % 4:
-        return []
     bounds = {}
-    for p in range(max(0, at - 0x40), at, 4):
-        ldr, add = struct.unpack_from("<II", code, p) if p + 8 <= len(code) else (0, 0)
-        reg = (ldr >> 12) & 0xF
-        if ldr & 0xFFFF0000 == 0xE59F0000 and add == 0xE08F0000 | reg << 16 | reg << 12 | reg:
-            literal = struct.unpack_from("<i", code, p + 8 + (ldr & 0xFFF))[0]
-            bounds[reg] = base + p + 4 + 8 + literal  # the add's pc reads 8 ahead
+    at = code.find(CALL_LOOP)
+    if at >= 0 and not at % 4:
+        for p in range(max(0, at - 0x40), at, 4):
+            ldr, add = struct.unpack_from("<II", code, p) if p + 8 <= len(code) else (0, 0)
+            reg = (ldr >> 12) & 0xF
+            if ldr & 0xFFFF0000 == 0xE59F0000 and add == 0xE08F0000 | reg << 16 | reg << 12 | reg:
+                literal = struct.unpack_from("<i", code, p + 8 + (ldr & 0xFFF))[0]
+                bounds[reg] = base + p + 4 + 8 + literal  # the add's pc reads 8 ahead
+    at = code.find(THUMB_CALL_LOOP)
+    if not bounds and at >= 0 and not at % 2:
+        for p in range(max(0, at - 0x20), at, 2):
+            ldr, add = struct.unpack_from("<HH", code, p)
+            reg = ldr >> 8 & 7
+            if ldr & 0xF800 == 0x4800 and add == 0x4478 | reg:  # Thumb pc: 4 ahead, the ldr's aligned down
+                literal = struct.unpack_from("<i", code, (p + 4 & ~3) + (ldr & 0xFF) * 4)[0]
+                bounds[reg] = base + p + 2 + 4 + literal
     if 4 not in bounds or 5 not in bounds or not 0 < bounds[5] - bounds[4] < len(code):
         return []
     start, end = bounds[4], bounds[5]
     return [start + i * 4 + struct.unpack_from("<i", code, start - base + i * 4)[0] for i in range((end - start) // 4)]
+
+
+def rotated_immediate(word):
+    value, rotate = word & 0xFF, (word >> 8 & 0xF) * 2
+    return (value >> rotate | value << (32 - rotate)) & 0xFFFFFFFF
+
+
+def jump_table_hints(code, base):
+    """hand-written assembly's jump tables (video decoders): "add pc, rA, rB" where one of the two was set a few
+    instructions before by "sub/add rX, pc, #i", the table, and the other loaded from it: each word of the table
+    is a target relative to it, which 3dsrecomp does not follow"""
+    words = struct.unpack_from(f"<{len(code) // 4}I", code)
+    end = base + len(words) * 4
+    found = set()
+    for i, w in enumerate(words):
+        if w & 0xFFFFF000 == 0xE28FE000:  # add lr, pc, #i: a call made by hand, which returns there
+            target = base + i * 4 + 8 + rotated_immediate(w)
+            if target < end and not target % 4:
+                found.add(target)
+            continue
+        if w & 0xFFF0F000 != 0xE080F000 or w & 0xFF0:  # add pc, rA, rB, unshifted
+            continue
+        regs = {w >> 16 & 0xF, w & 0xF}
+        for j in range(i - 1, max(-1, i - 13), -1):
+            p = words[j]
+            if p & 0xFFFF0000 not in (0xE24F0000, 0xE28F0000) or p >> 12 & 0xF not in regs:
+                continue
+            pc = base + j * 4 + 8
+            table = pc - rotated_immediate(p) if p & 0x00F00000 == 0x00400000 else pc + rotated_immediate(p)
+            k = table
+            while base <= k < end:  # the table ends at its first word that is not a target in the code
+                target = table + struct.unpack_from("<i", code, k - base)[0]
+                if target % 4 or not base <= target < end:
+                    break
+                found.add(target)
+                k += 4
+            break
+    return sorted(found)
 
 
 def default_cache():
@@ -140,19 +190,32 @@ def main():
         if not Path(recomp).is_file():
             sys.exit("3dsrecomp not found: give --3dsrecomp or CTRN_3DSRECOMP (https://github.com/fearkov/3dsrecomp)")
         print(f"[ctrn] {title_id:016X}: translating the code", flush=True)
+        start = time.monotonic()
+        # the files are named after their first function: one a hint moves would stay beside its successor and
+        # link twice; build_module keeps the objects by content, so nothing compiled is lost
+        for old in (game / "recomp").glob("code_*.c"):
+            old.unlink()
         subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints)], check=True)
-        print("[ctrn] compiling it (a few minutes the first time)", flush=True)
+        translated = time.monotonic()
+        print(f"[ctrn] translated in {translated - start:.0f} s; compiling it (a few minutes the first time)", flush=True)
         subprocess.run([sys.executable, str(HERE / "build_module.py"), str(game / "recomp"), str(module),
                         "--compiler", args.compiler], check=True)
+        print(f"[ctrn] compiled in {time.monotonic() - translated:.0f} s", flush=True)
 
     exheader, code = read_code(rom)
     text_start, text_pages = struct.unpack_from("<II", exheader, 0x10)
-    if not module.is_file():
-        game.mkdir(parents=True, exist_ok=True)
-        if not hints.is_file():
-            found = constructor_hints(code, text_start)
-            print(f"[ctrn] {len(found)} C++ constructors found in the code", flush=True)
-            hints.write_text("".join(f"{a:08X}\n" for a in found))
+    game.mkdir(parents=True, exist_ok=True)
+    hints.touch()  # 3dsrecomp refuses a missing --hints file, and a game may have none
+    # what the code's own patterns say 3dsrecomp cannot find; a cache made before a pattern was known gets it too
+    known = {int(word, 16) for word in hints.read_text().split()} if hints.is_file() else set()
+    constructors, tables = constructor_hints(code, text_start), jump_table_hints(code, text_start)
+    new = [a for a in dict.fromkeys(constructors + tables) if a not in known]
+    if new:
+        print(f"[ctrn] {len(constructors)} C++ constructors, {len(tables)} jump table targets in the code: "
+              f"{len(new)} new hints", flush=True)
+        with hints.open("a") as f:
+            f.write("".join(f"{a:08X}\n" for a in new))
+    if new or not module.is_file():
         build()
     if args.build_only:
         print(module)
@@ -174,6 +237,8 @@ def main():
         code_returned = run.wait()
         if missing is None or not text_start <= missing < text_start + text_pages * 0x1000:
             sys.exit(code_returned)
+        if missing in [int(word, 16) for word in hints.read_text().split()]:
+            sys.exit(f"[ctrn] {missing:08X} is a hint already and still not translated: 3dsrecomp needs a fix")
         print(f"[ctrn] {missing:08X} was not translated: added to the hints, rebuilding", flush=True)
         with hints.open("a") as f:
             f.write(f"{missing:08X}\n")
