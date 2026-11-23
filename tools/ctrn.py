@@ -163,6 +163,160 @@ def jump_table_hints(code, base):
     return sorted(found)
 
 
+def romfs_files(f, rom_header, ncch):
+    """(name, offset in the ROM, size) of each file of a decrypted ROM's RomFS (its IVFC level 3)"""
+    ivfc = ncch + struct.unpack_from("<I", rom_header, 0x1B0)[0] * 0x200
+    f.seek(ivfc)
+    header = f.read(0x60)
+    if header[:4] != b"IVFC":
+        return
+    master, log2 = struct.unpack_from("<I", header, 0x08)[0], struct.unpack_from("<I", header, 0x4C)[0]
+    level3 = ivfc + ((0x60 + master + (1 << log2) - 1) & ~((1 << log2) - 1))
+    f.seek(level3)
+    table = struct.unpack("<10I", f.read(0x28))
+    f.seek(level3 + table[7])
+    meta, data, at = f.read(table[8]), level3 + table[9], 0
+    while at + 0x20 <= len(meta):
+        offset, size, length = *struct.unpack_from("<QQ", meta, at + 8), struct.unpack_from("<I", meta, at + 0x1C)[0]
+        yield meta[at + 0x20:at + 0x20 + length].decode("utf-16-le", "replace"), data + offset, size
+        at += 0x20 + ((length + 3) & ~3)
+
+
+def unpacked(data):
+    """a whole file compressed as 3DS games do (Nintendo's LZ10/LZ11, Yaz0, Grezzo's LzS) unpacked, else None"""
+    out = bytearray()
+    if data[:4] == b"Yaz0":  # flags most significant bit first; a copy is 2 or 3 bytes
+        size, i = struct.unpack_from(">I", data, 4)[0], 16
+        while len(out) < size and i < len(data):
+            flags = data[i]
+            i += 1
+            for b in range(7, -1, -1):
+                if len(out) >= size or i >= len(data):
+                    break
+                if flags >> b & 1:
+                    out.append(data[i])
+                    i += 1
+                    continue
+                b0, b1 = data[i], data[i + 1]
+                i += 2
+                n = b0 >> 4
+                if n == 0:
+                    n, i = data[i] + 0x12, i + 1
+                else:
+                    n += 2
+                start = len(out) - (((b0 & 0xF) << 8 | b1) + 1)
+                for k in range(n):
+                    out.append(out[start + k])
+        return bytes(out)
+    if data[:4] == b"LzS\x01":  # LZSS: flags least significant bit first, a 4 KiB window starting at 0xFEE
+        size, i, ring, r = struct.unpack_from("<I", data, 8)[0], 16, bytearray(4096), 0xFEE
+        while len(out) < size and i < len(data):
+            flags = data[i]
+            i += 1
+            for b in range(8):
+                if len(out) >= size or i >= len(data):
+                    break
+                if flags >> b & 1:
+                    out.append(data[i])
+                    ring[r], r, i = data[i], (r + 1) & 0xFFF, i + 1
+                    continue
+                lo, hi = data[i], data[i + 1]
+                i += 2
+                for k in range((hi & 0xF) + 3):
+                    c = ring[((hi & 0xF0) << 4 | lo) + k & 0xFFF]
+                    out.append(c)
+                    ring[r], r = c, (r + 1) & 0xFFF
+        return bytes(out)
+    if len(data) > 8 and data[0] in (0x10, 0x11):  # Nintendo's LZ: flags most significant bit first
+        size, i = struct.unpack_from("<I", data, 0)[0] >> 8, 4
+        if size == 0:
+            size, i = struct.unpack_from("<I", data, 4)[0], 8
+        if not len(data) < size <= 16 * len(data):  # what a compressed file would be
+            return None
+        try:
+            while len(out) < size:
+                flags = data[i]
+                i += 1
+                for b in range(7, -1, -1):
+                    if len(out) >= size:
+                        break
+                    if not flags >> b & 1:
+                        out.append(data[i])
+                        i += 1
+                        continue
+                    b0, b1 = data[i], data[i + 1]
+                    if data[0] == 0x10 or b0 >> 4 > 1:
+                        n, distance, i = (b0 >> 4) + (3 if data[0] == 0x10 else 1), ((b0 & 0xF) << 8 | b1) + 1, i + 2
+                    elif b0 >> 4 == 0:
+                        n, distance, i = ((b0 & 0xF) << 4 | b1 >> 4) + 0x11, ((b1 & 0xF) << 8 | data[i + 2]) + 1, i + 3
+                    else:
+                        b2, b3 = data[i + 2], data[i + 3]
+                        n, distance, i = ((b0 & 0xF) << 12 | b1 << 4 | b2 >> 4) + 0x111, ((b2 & 0xF) << 8 | b3) + 1, i + 4
+                    start = len(out) - distance
+                    if start < 0:
+                        return None
+                    for k in range(n):
+                        out.append(out[start + k])
+        except IndexError:
+            return None
+        return bytes(out)
+    return None
+
+
+def shader_binaries(data):
+    """the shader binaries (DVLB: a header, the program DVLP, then each shader's DVLE) in a block of bytes"""
+    at = data.find(b"DVLB")
+    while at >= 0:
+        try:
+            count = struct.unpack_from("<I", data, at + 4)[0]
+            dvlp = at + 8 + 4 * count
+            if 0 < count <= 64 and data[dvlp:dvlp + 4] == b"DVLP":
+                code, words, descriptors, n = struct.unpack_from("<4I", data, dvlp + 8)
+                end = max(dvlp + code + 4 * words, dvlp + descriptors + 8 * n)
+                for i in range(count):
+                    dvle = at + struct.unpack_from("<I", data, at + 8 + 4 * i)[0]
+                    if data[dvle:dvle + 4] != b"DVLE":
+                        raise struct.error
+                    # constants, labels, outputs, uniforms (offset, count), then the symbols (offset, bytes)
+                    tables = struct.unpack_from("<10I", data, dvle + 0x18)
+                    end = max(end, dvle + 0x40, *(dvle + tables[k] + tables[k + 1] * size
+                                                  for k, size in ((0, 20), (2, 16), (4, 8), (6, 8), (8, 1))))
+                if end <= len(data):
+                    yield data[at:end]
+        except struct.error:
+            pass
+        at = data.find(b"DVLB", at + 4)
+
+
+def extract_shaders(rom, code, folder):
+    """every shader binary of a game, from its code and RomFS files (whole, or unpacked), into folder (by content)"""
+    folder.mkdir(parents=True, exist_ok=True)
+    found = {}
+
+    def keep(data, where):
+        for binary in shader_binaries(data):
+            found.setdefault(hashlib.sha256(binary).hexdigest()[:16], (binary, where))
+
+    keep(code, "code")
+    with open(rom, "rb") as f:
+        header, ncch = f.read(0x200), 0
+        if header[0x100:0x104] == b"NCSD":
+            ncch = struct.unpack_from("<I", header, 0x120)[0] * 0x200
+            f.seek(ncch)
+            header = f.read(0x200)
+        for name, offset, size in list(romfs_files(f, header, ncch)):
+            f.seek(offset)
+            data = f.read(size)
+            keep(data, name)
+            if inner := unpacked(data):
+                keep(inner, name + " (unpacked)")
+    for digest, (binary, where) in found.items():
+        (folder / f"{digest}.shbin").write_bytes(binary)
+    places = sorted({where for _, where in found.values()})
+    print(f"[ctrn] {len(found)} shader binaries in {len(places)} places: {', '.join(places[:8])}"
+          f"{'...' if len(places) > 8 else ''}", flush=True)
+
+
 def default_cache():
     base = os.environ.get("LOCALAPPDATA")
     return Path(base) / "ctrnative" if base else Path.home() / ".cache" / "ctrnative"
@@ -217,6 +371,15 @@ def main():
             f.write("".join(f"{a:08X}\n" for a in new))
     if new or not module.is_file():
         build()
+    # the GPU programs, translated ahead (picanative loads them at start); again when picanative changes
+    shaders, translator = game / "shaders", args.host.parent / ("pn_shaders.exe" if os.name == "nt" else "pn_shaders")
+    if not shaders.is_dir():
+        start = time.monotonic()
+        extract_shaders(rom, code, shaders)
+        print(f"[ctrn] shaders found in {time.monotonic() - start:.0f} s", flush=True)
+    translated = game / "shaders.pnvs"
+    if translator.is_file() and (not translated.is_file() or translated.stat().st_mtime < translator.stat().st_mtime):
+        subprocess.run([str(translator), str(translated), str(shaders)], check=True)
     if args.build_only:
         print(module)
         return

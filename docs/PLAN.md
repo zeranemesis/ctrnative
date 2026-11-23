@@ -134,7 +134,15 @@ est une couche de compatibilité, comme Wine. Restent à supprimer :
    `base + adresse`. Un accès hors de ce qui est mappé arrête la partie en
    nommant l'adresse (« the game wrote to … ») au lieu d'être ignoré.
 2. **Les shaders du GPU** traduits pendant la partie : traduits à l'avance,
-   avec le reste du jeu.
+   avec le reste du jeu. *Fait pour les programmes de sommets (branche
+   shaders-aot)* : le lanceur trouve les binaires DVLB (NSMB2 12, MM3D 5,
+   OoT 2, Pokémon 21 à 33 dont le code ; Smash 0, ses archives sont
+   compressées en zlib), picanative les traduit en WGSL et les charge au
+   démarrage ; aucun programme traduit pendant 4 000 images de NSMB2, MM3D et
+   OoT. Reste pendant la partie la compilation des pipelines par Dawn (WGSL
+   vers DXIL), qui dépend de l'état de dessin (sommets, TEV, mélange) et non
+   du seul programme : 1,6 à 2,7 s à froid sur 1 500 images, gardée ensuite
+   par le cache disque de Dawn.
 3. **Les listes de commandes PICA200** que le jeu fabrique et que picanative
    relit : la bibliothèque graphique du SDK que chaque jeu embarque remplacée
    par une version native, bibliothèque par bibliothèque. picanative ne sert
