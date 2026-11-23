@@ -336,7 +336,27 @@ GFX_NATIVES = [
     (5, "nw::font (NSMB2's drawer): pending matrices and colors sent",
      [0xE92D41F0, 0xE1A04000, 0xE2800F8E, 0xE5D41025, 0xE59F3058, 0xE590C00C, 0xE3A07000, 0xE1A02101,
       0xE0801201, 0xE1A05A02, 0xE1A06102, 0xE2452601, 0xE1822003, 0xE2865010, 0xE580200C, 0xE59F6030]),
+    (6, "nw::font (NSMB2's drawer): a text's matrix sent",
+     [0xE59F3058, 0xE92D0030, 0xE59F4054, 0xE3A0518E, 0xE5932000, 0xE59FC04C, 0xE2821004, 0xE4825008,
+      0xE5814000, 0xE5832000, 0xE5904000, 0xE2821008, 0xE8821010, 0xE2802004, 0xE2800024, 0xEC920A08]),
+    (7, "nw::font (NSMB2's drawer): a text's colors sent",
+     [0xE59FC054, 0xE92D03F0, 0xE3520000, 0xE59C6000, 0xE59F5048, 0xE2862004, 0x0A000007, 0xE5861000,
+      0xE9820021, 0xE285800A, 0xE282900C, 0xE5828000, 0xE58C9000, 0xE8BD03F0, 0xE12FFF1E, 0xE59F8020]),
+    (8, "nw::font (NSMB2's drawer): a text's list built (then translated once)",
+     [0xE92D4FF7, 0xE24DD058, 0xE1A05000, 0xE3A00000, 0xE3A04001, 0xE59D105C, 0xE5918044, 0xE1D8B0B4,
+      0xE1D810B6, 0xE5880018, 0xE5880020, 0xE15B0001, 0x81A0B001, 0xE35B0000, 0xE5C84008, 0x0A0001C8]),
+    (9, "nw::lyt (NSMB2's drawer): drawing begun",
+     [0xE92D4070, 0xE1A04000, 0xE3A00000, 0xE5840698, 0xE1A05001, 0xE584069C, 0xE3A01006, 0xE5840694,
+      0xE5C416A2, 0xE3A02001, 0xE5C426A0, 0xE1A02000, 0xE1A01000, 0xE1A00004, 0xEBFF9C9A, 0xE1A01005]),
+    (10, "nw::lyt (NSMB2's drawer): drawing ended",
+     [0xE92D4070, 0xE1A05001, 0xE5D01024, 0xE1A04000, 0xE3510000, 0x1BFF9E1E, 0xE1A01005, 0xE1A00004,
+      0xE8BD4070, 0xE1A00000, 0xE3110001, 0x1A000001, 0xE2800014, 0xEA0E5627, 0xE12FFF1E, 0xE92D4070]),
+    (11, "nw::lyt (NSMB2's drawer): drawing begun with a projection",
+     [0xE92D4070, 0xE1A04000, 0xE5900000, 0xE1A05001, 0xE3A01000, 0xE590200C, 0xE1A00004, 0xE12FFF32,
+      0xE2851004, 0xE1A00004, 0xE8BD4070, 0xE1A00000, 0xE92D4010, 0xE1A04000, 0xE2800034, 0xEBFDCB3D]),
 ]
+# natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
+AFTER_NATIVES = {8}
 
 
 def instruction_mask(word):
@@ -366,6 +386,19 @@ def natives_source(found):
     setting r12 to 0, and the game's own function runs"""
     out = ['#include "overrides.h"\n']
     for address, number, what in found:
+        if number in AFTER_NATIVES:
+            out.append(f"/* {what} */\n"
+                       f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                       f"    const uint32_t a0 = ctx->r[0], a1 = ctx->r[1], a2 = ctx->r[2], a3 = ctx->r[3];\n"
+                       f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                       f"    const uint32_t back = ctx->r[15] | (ctx->thumb ? 1u : 0u), result = ctx->r[0];\n"
+                       f"    ctx->r[0] = a0, ctx->r[1] = a1, ctx->r[2] = a2, ctx->r[3] = a3;\n"
+                       f"    ctx->r[12] = {number}u;\n"
+                       f"    SVC(0x{address:08X}u, 0xF0u);\n"
+                       f"    ctx->r[0] = result;\n"
+                       f"    RETURN_TO(back);\n"
+                       f"}}\n")
+            continue
         out.append(f"/* {what} */\n"
                    f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
                    f"    ctx->r[12] = {number}u;\n"

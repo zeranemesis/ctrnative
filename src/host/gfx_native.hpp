@@ -25,6 +25,12 @@ public:
     kLytMaterial = 3,
     kLytTextures = 4,
     kLytMatrices = 5,
+    kFontMatrix = 6,
+    kFontColors = 7,
+    kFontBuilt = 8, // after the game's function
+    kLytDrawBegin = 9,
+    kLytDrawEnd = 10,
+    kLytBeginProjected = 11,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -36,19 +42,23 @@ public:
 private:
   struct Program;
   static void run(void* self, uint32_t operation);
-  // the program as an operation (one done before is reused), marked at the game's command cursor
+  // the program's operation (one done before is reused)
+  uint32_t operation(const Program& program);
+  // the program as an operation, marked at the game's command cursor
   void emit(Program& program);
-  // what a block of commands the game keeps sets
-  void commands(Program& program, uint32_t address, uint32_t bytes);
+  // what a block of commands the game keeps sets; false if it runs other lists
+  bool commands(Program& program, uint32_t address, uint32_t bytes);
 
   // NSMB2's nw::lyt drawer (docs/NSMB2-LYT.md): its addresses, learnt from its batch flush
   struct Lyt {
-    uint32_t flush = 0, cursor = 0, draw_block = 0;
+    uint32_t flush = 0, cursor = 0, draw_block = 0, draw_begin = 0;
   } lyt_;
   void learn_lyt(uint32_t flush);
   void lyt_flush(Program& program, uint32_t drawer);
   void lyt_flush_pending(Program& program, uint32_t drawer);
   bool lyt_material(Program& program, uint32_t function, uint32_t drawer, uint32_t material);
+  bool lyt_block(Program& program, uint32_t block);
+  bool lyt_begin(Program& program, uint32_t function, uint32_t drawer, uint32_t flag);
   bool lyt_textures(Program& program, uint32_t function, uint32_t drawer, uint32_t material, bool flag);
 
   Kernel& kernel_;

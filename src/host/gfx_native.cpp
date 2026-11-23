@@ -14,6 +14,12 @@ const char* name(uint32_t which) {
   case GfxNatives::kLytMaterial: return "nw::lyt: a material set up";
   case GfxNatives::kLytTextures: return "nw::lyt: a material's textures set";
   case GfxNatives::kLytMatrices: return "nw::lyt: pending matrices and colors sent";
+  case GfxNatives::kFontMatrix: return "nw::font: a text's matrix sent";
+  case GfxNatives::kFontColors: return "nw::font: a text's colors sent";
+  case GfxNatives::kFontBuilt: return "nw::font: a text's list built, translated once";
+  case GfxNatives::kLytDrawBegin: return "nw::lyt: drawing begun";
+  case GfxNatives::kLytDrawEnd: return "nw::lyt: drawing ended";
+  case GfxNatives::kLytBeginProjected: return "nw::lyt: drawing begun with a projection";
   default: return "?";
   }
 }
@@ -75,34 +81,42 @@ void GfxNatives::run(void* self, uint32_t operation) {
   }
 }
 
-void GfxNatives::emit(Program& program) {
-  if (program.words.empty()) return;
+uint32_t GfxNatives::operation(const Program& program) {
   // one done before (most of a menu, every frame): its operation again
   auto [it, added] = known_.emplace(program.words, 0);
   if (added) {
     operations_.push_back(program.words);
     it->second = static_cast<uint32_t>(operations_.size());
   }
+  return it->second;
+}
+
+void GfxNatives::emit(Program& program) {
+  if (program.words.empty()) return;
   Memory& m = kernel_.memory();
   const uint32_t cursor = m.read32(lyt_.cursor);
-  m.write32(cursor, it->second);
+  m.write32(cursor, operation(program));
   m.write32(cursor + 4, 0x000F0000u | 0x2F0u); // the mark: one register, all bytes
   m.write32(lyt_.cursor, cursor + 8);
   program.words.clear();
 }
 
-void GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
-  // a block of commands the game keeps (constant data, or a template it fills in): what it sets
+bool GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
+  // a block of commands the game keeps (constant data, a template it fills in, a list it built once): what it sets;
+  // false for one that runs other lists (a jump), which cannot become an operation
   const Memory& m = kernel_.memory();
   for (uint32_t i = 0; i + 2 <= bytes / 4;) {
     const uint32_t first = m.read32(address + i * 4), header = m.read32(address + i * 4 + 4);
     const uint32_t reg = header & 0xFFFF, mask = header >> 16 & 0xF, extra = header >> 20 & 0xFF;
     const bool consecutive = header >> 31;
+    if (reg >= 0x300) break; // the list is over
+    if (reg + (consecutive ? extra : 0) >= 0x238 && reg <= 0x23D) return false;
     for (uint32_t k = 0; k <= extra; ++k)
       program.write(consecutive ? reg + k : reg, k == 0 ? first : m.read32(address + (i + 1 + k) * 4), mask);
     i += 2 + extra;
     i += i & 1;
   }
+  return true;
 }
 
 void GfxNatives::learn_lyt(uint32_t flush) {
@@ -278,6 +292,34 @@ bool GfxNatives::lyt_textures(Program& program, uint32_t function, uint32_t draw
   return true;
 }
 
+bool GfxNatives::lyt_block(Program& program, uint32_t block) {
+  // a block {address, size, ?, copied} the drawer hands nngxAdd3DCommand (0x5407cc): copied, its commands
+  Memory& m = kernel_.memory();
+  if (!read8(m, block + 0xC)) return false; // run where it is (a request of its own): left to the game
+  return commands(program, m.read32(block), m.read32(block + 4));
+}
+
+bool GfxNatives::lyt_begin(Program& program, uint32_t function, uint32_t drawer, uint32_t flag) {
+  // DrawBegin 0x1aaf30 (docs/NSMB2-LYT.md §9)
+  Memory& m = kernel_.memory();
+  if (!lyt_.cursor) lyt_.cursor = literal(m, function + 0x60);
+  Program block;
+  if (!(flag & 1) && !lyt_block(block, drawer + 4)) return false;
+  lyt_.draw_begin = function;
+  m.write32(drawer + 0x698, 0), m.write32(drawer + 0x69C, 0), m.write32(drawer + 0x694, 0);
+  write8(m, drawer + 0x6A2, 6), write8(m, drawer + 0x6A0, 1);
+  const uint32_t textures = literal(m, branch_target(m, function + 0x38) + 0x08); // 0x1921d8(drawer, 0, 0)
+  m.write32(textures + 0x08, 0), m.write32(textures + 0x28, 0), m.write32(textures + 0x48, 0);
+  if (!(flag & 1)) {
+    program.write(0x6F, 0, 0x2);
+    commands(program, literal(m, function + 0x80), 0x10); // a write to 0x080 with no byte
+    program.write(0x80, 0x1000, 0xB);
+    program.words.insert(program.words.end(), block.words.begin(), block.words.end());
+  }
+  m.write32(drawer + 0x684, 0);
+  return true;
+}
+
 bool GfxNatives::call(Thread& thread, uint32_t which) {
   ++calls_[which];
   const uint32_t function = thread.ctx.r[15];
@@ -307,6 +349,64 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kLytMaterial:
     done = lyt_material(program, function, r[0], r[1]);
     break;
+  case kLytDrawBegin:
+    done = lyt_begin(program, function, r[0], r[1]);
+    break;
+  case kLytDrawEnd: { // 0x1aaef4: the pending batch, then (flag bit 0 clear) the drawer's ending block
+    Memory& m = kernel_.memory();
+    learn_lyt(branch_target(m, function + 0x14));
+    Program block;
+    if (!(r[1] & 1) && !lyt_block(block, r[0] + 0x14)) break;
+    lyt_flush_pending(program, r[0]);
+    program.words.insert(program.words.end(), block.words.begin(), block.words.end());
+    done = true;
+    break;
+  }
+  case kLytBeginProjected: { // 0x1aa924: DrawBegin(0) (virtual), then the projection and parallax in c0-c4
+    Memory& m = kernel_.memory();
+    const uint32_t d = r[0], source = r[1] + 4;
+    if (!lyt_.draw_begin || m.read32(m.read32(d) + 0xC) != lyt_.draw_begin) break;
+    if (!lyt_begin(program, lyt_.draw_begin, d, 0)) break;
+    // 0x1aa954: the matrix kept in the drawer's block (D+0x30 m0, D+0x34 the 0x2C1 header, m1-m15 after)
+    std::vector<uint32_t> c(20);
+    for (uint32_t i = 0; i < 16; ++i) c[i] = m.read32(source + i * 4);
+    for (uint32_t i = 0; i < 16; ++i) m.write32(d + 0x34 + i * 4, c[i]);
+    m.write32(d + 0x30, c[0]);
+    m.write32(d + 0x34, 0x013F02C1);
+    m.write32(d + 0x84, 0);
+    for (uint32_t i = 0; i < 4; ++i) c[16 + i] = m.read32(d + 0x74 + i * 4); // parallax
+    program.uniforms(m.read32(d + 0x28) & 0x7F, c);
+    done = true;
+    break;
+  }
+  case kFontMatrix: { // 0x1aae20: 16 floats from c35 ([0x80000023][0x2C0] in its code)
+    Memory& m = kernel_.memory();
+    if (!lyt_.cursor) lyt_.cursor = literal(m, function);
+    std::vector<uint32_t> words(16);
+    for (uint32_t i = 0; i < 16; ++i) words[i] = m.read32(r[0] + i * 4);
+    program.uniforms(35, words);
+    done = true;
+    break;
+  }
+  case kFontColors: // 0x1aae8c: the gradient's two colors, to the TEV buffer or stage 3, and stage 4
+    if (!lyt_.cursor) lyt_.cursor = literal(kernel_.memory(), function);
+    if (r[2]) program.write(0xFD, r[1]), program.write(0xF3, r[0]);
+    else program.write(0xDB, r[0]), program.write(0xF3, r[1]);
+    done = true;
+    break;
+  case kFontBuilt: { // after 0x1aa1a4: the list it built, as an operation; its mark in its place
+    Memory& m = kernel_.memory();
+    const uint32_t buffer = m.read32(r[1] + 0x44);
+    if (read8(m, buffer + 9) & 6) break; // replayed by another path (transformed, chained): left as it is
+    const uint32_t base = m.read32(buffer + 0x10), words = m.read32(buffer + 0x18);
+    if (words < 2 || !commands(program, base, words * 4) || program.words.empty()) break;
+    m.write32(base, operation(program));
+    m.write32(base + 4, 0x000F0000u | 0x2F0u);
+    m.write32(buffer + 0x18, 2);
+    program.words.clear();
+    done = true;
+    break;
+  }
   case kLytTextures:
     done = lyt_textures(program, function, r[0], r[1], r[2] != 0);
     break;
