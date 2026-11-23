@@ -382,6 +382,14 @@ GFX_NATIVES = [
       0xE59F60A4, 0xE59F809C, 0xE5950000, 0xE59F20A0, 0xE2841F52, 0xE5806004, 0xE5808000, 0xE2800008]),
     (20, "nw::gfx: a shader's booleans and integers sent (6 words copied)",
      [0xE92D0E30, 0xE8B1003C, 0xE8B11800, 0xE8A0003C, 0xE8A01800, 0xE8BD0E30, 0xE12FFF1E]),
+    (21, "nw::gfx: a 3x4 matrix written after its index command",
+     [0xECB10A0C, 0xE5802004, 0xED800A04, 0xEDC00A03, 0xED801A02, 0xEDC01A00, 0xED802A08, 0xEDC02A07,
+      0xED803A06, 0xEDC03A05, 0xED804A0C, 0xEDC04A0B, 0xED805A0A, 0xEDC05A09, 0xE12FFF1E]),
+    (22, "nw::gfx: a 4x4 matrix written after its index command",
+     [0xECB10A10, 0xE5802004, 0xED800A04, 0xEDC00A03, 0xED801A02, 0xEDC01A00, 0xED802A08, 0xEDC02A07,
+      0xED803A06, 0xEDC03A05, 0xED804A0C, 0xEDC04A0B, 0xED805A0A, 0xEDC05A09, 0xED806A10, 0xEDC06A0F]),
+    (23, "nw::gfx: a vector written after its index command",
+     [0xECB10A03, 0xE3A03000, 0xE5803000, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xE12FFF1E]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}

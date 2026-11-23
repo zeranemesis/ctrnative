@@ -26,6 +26,9 @@ const char* name(uint32_t which) {
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   case GfxNatives::kViewport: return "NSMB2: a viewport set";
   case GfxNatives::kGfxCamera: return "nw::gfx: a camera's matrices sent";
+  case GfxNatives::kGfxRows3: return "nw::gfx: a 3x4 matrix sent";
+  case GfxNatives::kGfxRows4: return "nw::gfx: a 4x4 matrix sent";
+  case GfxNatives::kGfxVec3: return "nw::gfx: a vector sent";
   case GfxNatives::kGfxUniformBlock: return "nw::gfx: a shader's booleans and integers sent";
   case GfxNatives::kCopyUnaligned: return "__aeabi_memcpy (unaligned): a block copied into the list";
   case GfxNatives::kCopyAligned: return "__aeabi_memcpy4: a block copied into the list";
@@ -409,6 +412,40 @@ bool GfxNatives::list_copy(uint32_t destination, uint32_t source, uint32_t size)
   return true;
 }
 
+bool GfxNatives::uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3) {
+  // nw::gfx's uniform writers (0x11d7d0 3 rows, 0x11d854 4 rows, 0x11d8a0 a vec3): the caller put the index command
+  // at the cursor, they write the data after it. Taken when the whole is one command here: the rows from their
+  // source, set directly; the index command and the data, a mark and a padding
+  Memory& m = kernel_.memory();
+  if (!lyt_.cursor || where - 8 != m.read32(lyt_.cursor)) return false;
+  const uint32_t index = m.read32(where - 8), index_header = m.read32(where - 4);
+  const uint32_t reg = index_header & 0xFFFF;
+  if (!(index >> 31) || (reg != 0x2C0 && reg != 0x290)) return false;
+  uint32_t footprint; // words, from the index command
+  std::vector<uint32_t> w(rows * 4);
+  if (vec3) {
+    if (index_header != (0x804F0000u | reg)) return false; // the index, then the 4 data words in one command
+    w = {0, m.read32(source + 8), m.read32(source + 4), m.read32(source)};
+    footprint = 6;
+  } else {
+    if ((header & 0xFFFF) != reg + 1 || (header >> 20 & 0xFF) != rows * 4 - 1) return false;
+    for (uint32_t i = 0; i < rows; ++i)
+      for (uint32_t k = 0; k < 4; ++k) w[i * 4 + k] = m.read32(source + i * 16 + (3 - k) * 4);
+    footprint = (2 + 1 + rows * 4 + 1) & ~1u;
+  }
+  Program program;
+  program.uniforms(index & 0x7F, w, reg == 0x290);
+  uint32_t at = mark_at(where - 8, operation(program)), left = footprint - 2;
+  while (left) {
+    const uint32_t extra = std::min<uint32_t>(left - 2, 254);
+    m.write32(at, 0);
+    m.write32(at + 4, 0x2F1u | extra << 20);
+    at += (2 + extra) * 4;
+    left -= 2 + extra;
+  }
+  return true;
+}
+
 bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy) {
   // nngxAdd3DCommand 0x5407e4: the block's commands become an operation. Copied, they are read now; not copied (a
   // request of its own: a model's commands, prepared once), translated once and kept while the block is unchanged
@@ -503,6 +540,15 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kCopyAligned:
   case kCopy:
     done = list_copy(r[0], r[1], r[2]);
+    break;
+  case kGfxRows3:
+    done = uniform_rows(r[0], r[1], 3, r[2], false);
+    break;
+  case kGfxRows4:
+    done = uniform_rows(r[0], r[1], 4, r[2], false);
+    break;
+  case kGfxVec3:
+    done = uniform_rows(r[0], r[1], 1, 0, true);
     break;
   case kGfxCamera: { // 0x170c74(ctx, camera, force): view (camera+0x148, 3 rows) in c90, projection (+0x1a8) in c86
     Memory& m = kernel_.memory();

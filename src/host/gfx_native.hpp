@@ -40,6 +40,9 @@ public:
     kCopy = 18,
     kGfxCamera = 19,
     kGfxUniformBlock = 20,
+    kGfxRows3 = 21,
+    kGfxRows4 = 22,
+    kGfxVec3 = 23,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -71,6 +74,7 @@ private:
   // a block in memory as an operation, translated once (0: not one)
   uint32_t translated(uint32_t address, uint32_t size);
   bool list_copy(uint32_t destination, uint32_t source, uint32_t size);
+  bool uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3);
   bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);
   bool lyt_begin(Program& program, uint32_t function, uint32_t drawer, uint32_t flag);
