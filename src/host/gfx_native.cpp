@@ -30,8 +30,8 @@ const char* name(uint32_t which) {
   case GfxNatives::kAroundFirst + 2: return "nw::gfx: lighting tables' inputs, around";
   case GfxNatives::kAroundFirst + 3: return "nw::gfx: texture coordinates, around";
   case GfxNatives::kAroundFirst + 4: return "nw::gfx: light environment, around";
-  case GfxNatives::kAroundFirst + 5: return "NSMB2: a render target, around";
-  case GfxNatives::kAroundFirst + 6: return "nw::gfx: dummy commands, around";
+  case GfxNatives::kAroundFirst + 5: return "NSMB2: a render target (translated after)";
+  case GfxNatives::kAroundFirst + 6: return "nw::gfx: a 312-byte block copied";
   case GfxNatives::kAroundFirst + 7: return "nngx: the list split, around";
   case GfxNatives::kGameDraw: return "NSMB2: an indexed draw";
   case GfxNatives::kGameVertexFormat: return "NSMB2: a vertex format set (translated after)";
@@ -751,8 +751,18 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kGameVertexFormat: // after NSMB2 0x487ea0(layout, where): what it wrote, up to where it stopped (r3)
     done = written(r[1], r[3], kAtItsPlace);
     break;
+  case kAroundFirst + 5: // after NSMB2 0x10e8f4(state, where): a render target's commands, up to where it stopped
+    done = written(r[1], r[3], kAtItsPlace);
+    break;
+  case kAroundFirst + 6: { // 0x11efd8(where, block): 312 bytes copied (an unrolled copy), the end returned
+    Memory& m = kernel_.memory();
+    if (!lyt_.cursor || r[0] - m.read32(lyt_.cursor) >= 0x10000) break;
+    done = list_copy(r[0], r[1], 312);
+    if (done) thread.ctx.r[0] = r[0] + 312;
+    break;
+  }
   case kAroundFirst + 0: case kAroundFirst + 1: case kAroundFirst + 2: case kAroundFirst + 3:
-  case kAroundFirst + 4: case kAroundFirst + 5: case kAroundFirst + 6: case kAroundFirst + 7:
+  case kAroundFirst + 4: case kAroundFirst + 7:
     // what the game's function just wrote at the cursor, [r2, r3): an operation of the frame (or the recording)
     if (!lyt_.cursor) lyt_.cursor = 0; // the cursor's place is in the generated code; the words are where they are
     done = r[3] != r[2] && written(r[2], r[3], 0);

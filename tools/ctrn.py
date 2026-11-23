@@ -426,12 +426,12 @@ GFX_NATIVES = [
      [0xE92D41F0, 0xE59F5190, 0xE59F0190, 0xE595409C, 0xE5901000, 0xE5942004, 0xE0412002, 0xE584200C, 0xE5943014, 0xE1530002, 0x0A00005A, 0xE59F3170]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
-AFTER_NATIVES = {8, 30}
+AFTER_NATIVES = {8, 30, 36}
 # copies: the host is asked only when the destination is where the game's next command goes
 LIST_COPY_NATIVES = {16, 17, 18}
 # natives around the game's function: it runs, then the host takes what it wrote at the cursor (r2: where the cursor
 # was, r3: where it is) as one operation; the game's code computes, the host sets, picanative reads nothing there
-AROUND_NATIVES = set(range(31, 39))
+AROUND_NATIVES = set(range(31, 39)) - {36, 37}
 NNGX_ADD_3D_COMMAND = 12  # its literal at +0x10 is that place's address
 
 
