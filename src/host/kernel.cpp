@@ -78,27 +78,9 @@ Clock::time_point after_ns(uint64_t ns) {
 
 } // namespace
 
-// the recompiled code's view of the host: memory slow paths, code lookup, svcs
+// the recompiled code's view of the host: code lookup, svcs (memory is Memory::fastmem)
 struct Callbacks {
   static Kernel& kernel(Context* ctx);
-  static uint8_t read8(Context* ctx, uint32_t a) {
-    uint8_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 1);
-    return v;
-  }
-  static uint16_t read16(Context* ctx, uint32_t a) {
-    uint16_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 2);
-    return v;
-  }
-  static uint32_t read32(Context* ctx, uint32_t a) {
-    uint32_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 4);
-    return v;
-  }
-  static void write8(Context* ctx, uint32_t a, uint8_t v) { kernel(ctx).memory_.write(a, &v, 1); }
-  static void write16(Context* ctx, uint32_t a, uint16_t v) { kernel(ctx).memory_.write(a, &v, 2); }
-  static void write32(Context* ctx, uint32_t a, uint32_t v) { kernel(ctx).memory_.write(a, &v, 4); }
   static void interpret(Context* ctx, uint32_t address, uint32_t opcode) {
     char why[96];
     std::snprintf(why, sizeof why, "instruction %08x at %08x is not recompiled (no interpreter)", opcode, address);
@@ -116,8 +98,7 @@ Kernel& Callbacks::kernel(Context*) { return *the_kernel; }
 
 Kernel::Kernel(Memory& memory, const Module& module) : memory_(memory), module_(module) {
   the_kernel = this;
-  host_ = Host{Callbacks::read8,  Callbacks::read16,    Callbacks::read32, Callbacks::write8, Callbacks::write16,
-               Callbacks::write32, Callbacks::interpret, Callbacks::lookup, Callbacks::svc};
+  host_ = Host{Callbacks::interpret, Callbacks::lookup, Callbacks::svc};
 }
 
 uint64_t Kernel::ticks() const {
@@ -226,8 +207,7 @@ std::shared_ptr<Thread> Kernel::create_thread(uint32_t entry, uint32_t stack, ui
   c.fpscr = &thread->fpscr;
   c.host = &host_;
   c.user = thread.get();
-  c.read_pages = memory_.read_pages();
-  c.write_pages = memory_.write_pages();
+  c.fastmem = memory_.fastmem();
   map_tls(*thread);
   threads_.push_back(thread);
   start_host_thread([](void* p) { the_kernel->thread_main(static_cast<Thread*>(p)); }, thread.get());
@@ -496,7 +476,7 @@ void Kernel::thread_main(Thread* self) {
       fprintf(stderr, "[kernel] bad pc %08x, last dispatch %08x, lr %08x sp %08x r0-r3 %08x %08x %08x %08x prio %d, stack:",
               pc, self->last_pc, c.r[14], c.r[13], c.r[0], c.r[1], c.r[2], c.r[3], self->priority);
       for (uint32_t a = c.r[13], n = 0; n < 16 && a < c.r[13] + 0x400; a += 4) {
-        uint8_t* page = c.read_pages[a >> 12];
+        uint8_t* page = memory_.read_pages()[a >> 12];
         if (!page) break;
         uint32_t w;
         memcpy(&w, page + (a & 0xFFF), 4);
