@@ -136,8 +136,10 @@ void submitted(Memory& memory, uint32_t address, uint32_t size) {
   std::lock_guard<std::mutex> lock(g_mutex);
   std::vector<uintptr_t> pages;
   for (uint32_t i = 0; i + 4 <= size; i += 4) {
-    const uint8_t* word = memory.host(address + i);
-    if (!word) continue;
+    // the game's own view of its memory (fastmem): where its code writes, so where a protection traps it; the
+    // host writes through the section instead, which these pages do not watch (its words count as unknown)
+    if (!memory.host(address + i)) continue;
+    const uint8_t* word = memory.fastmem() + address + i;
     const auto found = g_writers.find(reinterpret_cast<uintptr_t>(word));
     ++g_counts[found != g_writers.end() ? found->second : Writer{}];
     ++g_words;

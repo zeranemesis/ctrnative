@@ -98,11 +98,13 @@ LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
 }
 
 // CTRN_WATCH_WRITE=address: every write to the 4 bytes of guest memory there, by the game's code, the host or the
-// GPU engine, with the writer (module and offset), the guest function last entered and the value: the host page
-// holding them is made read-only, each write faults, runs one step and the page is protected again
+// GPU engine, with the writer (module and offset), the guest function last entered and the value: the pages
+// holding them, in the game's view of its memory (fastmem, its code's writes) and the host's (the services' and
+// the engine's), are made read-only, each write faults, runs one step and the page is protected again
 struct {
-  uintptr_t at = 0;
-  void* page = nullptr;
+  uintptr_t at[2] = {};
+  void* page[2] = {};
+  int hit = -1; // the view the step under way writes through
   const host::Kernel* kernel = nullptr;
   uint32_t guest = 0, before = 0;
   bool ours = false;
@@ -110,14 +112,18 @@ struct {
 
 LONG WINAPI watch_writes(EXCEPTION_POINTERS* e) {
   const EXCEPTION_RECORD& r = *e->ExceptionRecord;
-  if (!g_watch.page) return EXCEPTION_CONTINUE_SEARCH;
+  if (!g_watch.page[0]) return EXCEPTION_CONTINUE_SEARCH;
   DWORD old;
-  if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters > 1 && r.ExceptionInformation[0] == 1 &&
-      r.ExceptionInformation[1] - reinterpret_cast<uintptr_t>(g_watch.page) < 0x1000) {
+  int view = -1;
+  if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters > 1 && r.ExceptionInformation[0] == 1)
+    for (int v = 0; v < 2; ++v)
+      if (r.ExceptionInformation[1] - reinterpret_cast<uintptr_t>(g_watch.page[v]) < 0x1000) view = v;
+  if (view >= 0) {
     const uintptr_t a = r.ExceptionInformation[1];
-    g_watch.ours = a + 8 > g_watch.at && a < g_watch.at + 4;
+    g_watch.hit = view;
+    g_watch.ours = a + 8 > g_watch.at[view] && a < g_watch.at[view] + 4;
     if (g_watch.ours) {
-      std::memcpy(&g_watch.before, reinterpret_cast<void*>(g_watch.at), 4);
+      std::memcpy(&g_watch.before, reinterpret_cast<void*>(g_watch.at[view]), 4);
       HMODULE module = nullptr;
       char name[MAX_PATH] = "?";
       if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -129,18 +135,19 @@ LONG WINAPI watch_writes(EXCEPTION_POINTERS* e) {
                    static_cast<unsigned long long>(static_cast<char*>(r.ExceptionAddress) - reinterpret_cast<char*>(module)),
                    g_watch.kernel ? g_watch.kernel->running_pc() : 0);
     }
-    VirtualProtect(g_watch.page, 0x1000, PAGE_READWRITE, &old);
+    VirtualProtect(g_watch.page[view], 0x1000, PAGE_READWRITE, &old);
     e->ContextRecord->EFlags |= 0x100; // one instruction, then protected again
     return EXCEPTION_CONTINUE_EXECUTION;
   }
-  if (r.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+  if (r.ExceptionCode == EXCEPTION_SINGLE_STEP && g_watch.hit >= 0) {
     if (g_watch.ours) {
       uint32_t now;
-      std::memcpy(&now, reinterpret_cast<void*>(g_watch.at), 4);
-      std::fprintf(stderr, ": %08x -> %08x\n", g_watch.before, now);
+      std::memcpy(&now, reinterpret_cast<void*>(g_watch.at[g_watch.hit]), 4);
+      std::fprintf(stderr, ": %08x -> %08x (%s)\n", g_watch.before, now, g_watch.hit ? "host's view" : "game's view");
       g_watch.ours = false;
     }
-    VirtualProtect(g_watch.page, 0x1000, PAGE_READONLY, &old);
+    VirtualProtect(g_watch.page[g_watch.hit], 0x1000, PAGE_READONLY, &old);
+    g_watch.hit = -1;
     return EXCEPTION_CONTINUE_EXECUTION;
   }
   return EXCEPTION_CONTINUE_SEARCH;
@@ -315,14 +322,17 @@ int main(int argc, char** argv) {
 #endif
   while (!kernel.stopped()) {
 #if defined(_WIN32)
-    if (watch_env && !g_watch.page) { // armed once the game has mapped the address
+    if (watch_env && !g_watch.page[0]) { // armed once the game has mapped the address
       const uint32_t guest = static_cast<uint32_t>(std::strtoul(watch_env, nullptr, 16));
       if (uint8_t* host_byte = memory.host(guest)) {
-        g_watch.guest = guest, g_watch.at = reinterpret_cast<uintptr_t>(host_byte);
-        void* page = reinterpret_cast<void*>(g_watch.at & ~uintptr_t{0xFFF});
-        DWORD old;
-        VirtualProtect(page, 0x1000, PAGE_READONLY, &old);
-        g_watch.page = page;
+        g_watch.guest = guest;
+        g_watch.at[0] = reinterpret_cast<uintptr_t>(memory.fastmem() + guest), g_watch.at[1] = reinterpret_cast<uintptr_t>(host_byte);
+        for (int v = 1; v >= 0; --v) { // the game's view last: page[0] set arms the handler
+          void* page = reinterpret_cast<void*>(g_watch.at[v] & ~uintptr_t{0xFFF});
+          DWORD old;
+          VirtualProtect(page, 0x1000, PAGE_READONLY, &old);
+          g_watch.page[v] = page;
+        }
         std::fprintf(stderr, "[watch] %08x armed\n", guest);
       }
     }
