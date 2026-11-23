@@ -324,6 +324,9 @@ GFX_NATIVES = [
     (1, "nngx: a prepared list copied into the current one (SDK 2012)",
      [0xE92D4FFF, 0xE200201F, 0xE24DD004, 0xE3A04000, 0xE3A09001, 0xE59F1000, 0xE59D8038, 0xE59DB040,
       0xE0812102, 0xE591609C, 0xE59F1000, 0xE592701C, 0xE5915000, 0xE3570000, 0x0A000000, 0xE5971000]),
+    (2, "nw::lyt (NSMB2's drawer): a batch of rectangles drawn",
+     [0xE92D41F0, 0xE1A04000, 0xE2800088, 0xE5D41024, 0xE590300C, 0xE59F8180, 0xE59F6180, 0xE1A02101,
+      0xE5803008, 0xE1A0C102, 0xE1A03A02, 0xE2432601, 0xE1822008, 0xE0801201, 0xE580200C, 0xE3A07000]),
 ]
 
 
@@ -397,7 +400,9 @@ def main():
         start = time.monotonic()
         # the files are named after their first function: one a hint moves would stay beside its successor and
         # link twice; build_module keeps the objects by content, so nothing compiled is lost
-        for old in (game / "recomp").glob("code_*.c"):
+        # what the last generation wrote: a file it would not write again (a cut moved, an override renamed) would
+        # be compiled with the new ones
+        for old in [*(game / "recomp").glob("code_*.c"), *(game / "recomp" / "hand").glob("*.c")]:
             old.unlink()
         overrides = ["--overrides", str(natives_dir)] if (natives_dir / "gfx_natives.c").is_file() else []
         subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides], check=True)
