@@ -1,6 +1,7 @@
 #include "gfx_native.hpp"
 
 #include <cstdio>
+#include <cstring>
 
 namespace host {
 
@@ -10,11 +11,14 @@ const char* name(uint32_t which) {
   switch (which) {
   case GfxNatives::kNngxCopyPreparedList: return "nngx: a prepared list copied into the current one";
   case GfxNatives::kLytFlushBatch: return "nw::lyt: a batch of rectangles drawn";
+  case GfxNatives::kLytMaterial: return "nw::lyt: a material set up";
+  case GfxNatives::kLytTextures: return "nw::lyt: a material's textures set";
+  case GfxNatives::kLytMatrices: return "nw::lyt: pending matrices and colors sent";
   default: return "?";
   }
 }
 
-// the target of the `bl` at `at`
+// the target of the `b`/`bl` at `at`
 uint32_t branch_target(const Memory& m, uint32_t at) {
   const uint32_t word = m.read32(at);
   return at + 8 + (static_cast<uint32_t>(static_cast<int32_t>(word << 8) >> 6));
@@ -23,16 +27,33 @@ uint32_t branch_target(const Memory& m, uint32_t at) {
 // the constant an `ldr rN, [pc, #i]` at `at` loads
 uint32_t literal(const Memory& m, uint32_t at) { return m.read32(at + 8 + (m.read32(at) & 0xFFF)); }
 
+uint8_t read8(const Memory& m, uint32_t at) {
+  uint8_t b = 0;
+  m.read(at, &b, 1);
+  return b;
+}
+void write8(Memory& m, uint32_t at, uint8_t b) { m.write(at, &b, 1); }
+
 } // namespace
+
+// An operation's program: register writes and vertex uniform loads, in order.
+//   reg | mask << 16, value              a register (reg < 0x300)
+//   0x80000000 | first << 8 | count, 4 × count words   vertex float uniforms, w first
+struct GfxNatives::Program {
+  std::vector<uint32_t> words;
+  void write(uint32_t reg, uint32_t value, uint32_t mask = 0xF) {
+    words.push_back(reg | mask << 16);
+    words.push_back(value);
+  }
+  void uniforms(uint32_t first, const std::vector<uint32_t>& data) {
+    if (data.empty()) return;
+    words.push_back(0x80000000u | first << 8 | static_cast<uint32_t>(data.size() / 4));
+    words.insert(words.end(), data.begin(), data.end());
+  }
+};
 
 GfxNatives::GfxNatives(Kernel& kernel, pn_engine* engine) : kernel_(kernel), engine_(engine) {
   pn_set_native_operations(engine_, &GfxNatives::run, this);
-}
-
-uint32_t GfxNatives::add(Operation operation) {
-  // shortcut: operations are kept for good; a long game makes many, free those no mark names any more
-  operations_.push_back(std::move(operation));
-  return static_cast<uint32_t>(operations_.size());
 }
 
 void GfxNatives::run(void* self, uint32_t operation) {
@@ -41,114 +62,261 @@ void GfxNatives::run(void* self, uint32_t operation) {
     ++natives.unknown_marks_;
     return;
   }
-  natives.operations_[operation - 1](natives.engine_);
+  const std::vector<uint32_t>& w = natives.operations_[operation - 1];
+  for (size_t i = 0; i + 1 < w.size();) {
+    if (w[i] >> 31) {
+      const uint32_t first = w[i] >> 8 & 0x7F, count = w[i] & 0xFF;
+      pn_vertex_uniforms(natives.engine_, first, &w[i + 1], count);
+      i += 1 + count * 4;
+    } else {
+      pn_write_register(natives.engine_, w[i] & 0xFFFF, w[i + 1], w[i] >> 16 & 0xF);
+      i += 2;
+    }
+  }
 }
 
-void GfxNatives::mark(uint32_t cursor_at, uint32_t operation) {
+void GfxNatives::emit(Program& program) {
+  if (program.words.empty()) return;
+  // one done before (most of a menu, every frame): its operation again
+  auto [it, added] = known_.emplace(program.words, 0);
+  if (added) {
+    operations_.push_back(program.words);
+    it->second = static_cast<uint32_t>(operations_.size());
+  }
   Memory& m = kernel_.memory();
-  const uint32_t cursor = m.read32(cursor_at);
-  m.write32(cursor, operation);
-  m.write32(cursor + 4, 0x000F0000u | 0x2F0u); // one register, all bytes
-  m.write32(cursor_at, cursor + 8);
+  const uint32_t cursor = m.read32(lyt_.cursor);
+  m.write32(cursor, it->second);
+  m.write32(cursor + 4, 0x000F0000u | 0x2F0u); // the mark: one register, all bytes
+  m.write32(lyt_.cursor, cursor + 8);
+  program.words.clear();
 }
 
-const std::vector<GfxNatives::Write>& GfxNatives::static_block(uint32_t address, uint32_t bytes) {
-  auto& writes = blocks_[address];
-  if (!writes.empty()) return writes;
-  // a command block in the game's constant data: read once, its writes kept
+void GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
+  // a block of commands the game keeps (constant data, or a template it fills in): what it sets
   const Memory& m = kernel_.memory();
   for (uint32_t i = 0; i + 2 <= bytes / 4;) {
     const uint32_t first = m.read32(address + i * 4), header = m.read32(address + i * 4 + 4);
     const uint32_t reg = header & 0xFFFF, mask = header >> 16 & 0xF, extra = header >> 20 & 0xFF;
     const bool consecutive = header >> 31;
-    for (uint32_t k = 0; k <= extra; ++k) {
-      const uint32_t value = k == 0 ? first : m.read32(address + (i + 1 + k) * 4);
-      writes.push_back({consecutive ? reg + k : reg, value, mask});
-    }
+    for (uint32_t k = 0; k <= extra; ++k)
+      program.write(consecutive ? reg + k : reg, k == 0 ? first : m.read32(address + (i + 1 + k) * 4), mask);
     i += 2 + extra;
     i += i & 1;
   }
-  return writes;
 }
 
-bool GfxNatives::lyt_flush(Thread& thread) {
-  // NSMB2's nw::lyt drawer (docs/NSMB2-LYT-NATIF.md): rectangles, matrices and colors, texture coordinates, each an
-  // array of vec4 behind a uniform block; the vertex program reads them all. Done here: the same uniforms, the same
-  // draw, set directly in picanative, with no command made.
+void GfxNatives::learn_lyt(uint32_t flush) {
+  if (lyt_.flush) return;
+  const Memory& m = kernel_.memory();
+  lyt_.flush = flush;
+  lyt_.cursor = literal(m, flush + 0x18);                            // ldr r6, =cursor
+  lyt_.draw_block = literal(m, branch_target(m, flush + 0x164));     // bl → ldr r0, =block
+}
+
+// NSMB2's nw::lyt drawer: docs/NSMB2-LYT.md (§8) and NSMB2-LYT-NATIF.md
+void GfxNatives::lyt_flush(Program& program, uint32_t drawer) {
   Memory& m = kernel_.memory();
-  const uint32_t function = thread.ctx.r[15], drawer = thread.ctx.r[0];
-  const uint32_t cursor_at = literal(m, function + 0x18); // ldr r6, =cursor
-  const uint32_t draw_block = literal(m, branch_target(m, function + 0x164));
-
-  auto rows = [&](uint32_t block, uint32_t pointer, uint32_t count, uint32_t& first, std::vector<uint32_t>& words) {
-    first = m.read32(drawer + block) & 0x7F; // the 0x2C0 index the block starts with
-    const uint32_t at = m.read32(drawer + pointer);
-    words.resize(count * 4);
-    for (uint32_t i = 0; i < count * 4; ++i) words[i] = m.read32(at + i * 4);
-  };
-  struct Batch {
-    uint32_t rect_first = 0, matrix_first = 0, coord_first = 0;
-    std::vector<uint32_t> rects, matrices, coords;
-    uint32_t coord_sets = 0, index = 0, count = 0;
-  };
-  auto b = std::make_shared<Batch>();
-  uint8_t counts[3]; // rectangles, matrix rows, coordinate rows
+  uint8_t counts[3]; // rectangles, matrix and color rows, rectangle and coordinate rows
   m.read(drawer + 0x24, counts, 3);
-  const uint32_t rects = counts[0], matrices = counts[1], coords = counts[2];
-  rows(0x88, 0x668, rects, b->rect_first, b->rects);
-  rows(0x238, 0x66C, matrices, b->matrix_first, b->matrices);
-  rows(0x448, 0x670, coords, b->coord_first, b->coords);
-  b->coord_sets = m.read32(drawer + 0x69C);
-  b->count = rects * 6;
-  // the index buffer's offset, as 0x4944a8 picks it
-  const uint32_t from = b->count > 0x10 ? b->count * 2 - 0x20 : 0;
-  b->index = 0x80000000u | (((m.read32(drawer + 0x680) + from) & 0xFFF) >= 0xFE0 ? 0x20u : 0u);
-  const auto* block = &static_block(draw_block, 0x40);
-
-  // a batch drawn before (most of a menu, every frame): its operation again
-  std::vector<uint32_t> key{kLytFlushBatch, b->rect_first, b->matrix_first, b->coord_first, b->coord_sets, b->index,
-                            b->count, rects, matrices, coords, draw_block};
-  for (const auto* part : {&b->rects, &b->matrices, &b->coords}) key.insert(key.end(), part->begin(), part->end());
-  if (const auto known = known_.find(key); known != known_.end()) {
-    mark(cursor_at, known->second);
-    const uint8_t empty[3] = {};
-    m.write(drawer + 0x24, empty, 3);
-    return true;
-  }
-
-  const uint32_t operation = add([b, block](pn_engine* e) {
-    pn_vertex_uniforms(e, b->rect_first, b->rects.data(), static_cast<uint32_t>(b->rects.size() / 4));
-    if (!b->matrices.empty())
-      pn_vertex_uniforms(e, b->matrix_first, b->matrices.data(), static_cast<uint32_t>(b->matrices.size() / 4));
-    if (!b->coords.empty())
-      pn_vertex_uniforms(e, b->coord_first, b->coords.data(), static_cast<uint32_t>(b->coords.size() / 4));
-    pn_write_register(e, 0x2B1, b->coord_sets, 0xF); // i0: the loop over texture coordinate sets
-    pn_write_register(e, 0x227, b->index, 0xF);
-    pn_write_register(e, 0x228, b->count, 0xF);
-    for (const Write& w : *block) pn_write_register(e, w.reg, w.value, w.mask);
-  });
-  known_.emplace(std::move(key), operation);
-  mark(cursor_at, operation);
-  // what the game's flush leaves: an empty batch
+  auto rows = [&](uint32_t block, uint32_t pointer, uint32_t count) {
+    std::vector<uint32_t> words(count * 4);
+    const uint32_t at = m.read32(drawer + pointer);
+    for (uint32_t i = 0; i < count * 4; ++i) words[i] = m.read32(at + i * 4);
+    program.uniforms(m.read32(drawer + block) & 0x7F, words); // the block starts with its 0x2C0 index
+  };
+  rows(0x88, 0x668, counts[0]);
+  rows(0x238, 0x66C, counts[1]);
+  rows(0x448, 0x670, counts[2]);
+  const uint32_t vertices = counts[0] * 6u;
+  const uint32_t from = vertices > 0x10 ? vertices * 2 - 0x20 : 0; // 0x4944a8: indices never across 4 KiB
+  program.write(0x2B1, m.read32(drawer + 0x69C));                // i0: the coordinate rows per rectangle
+  program.write(0x227, 0x80000000u | (((m.read32(drawer + 0x680) + from) & 0xFFF) >= 0xFE0 ? 0x20u : 0u));
+  program.write(0x228, vertices);
+  commands(program, lyt_.draw_block, 0x40);
   const uint8_t empty[3] = {};
   m.write(drawer + 0x24, empty, 3);
+}
+
+void GfxNatives::lyt_flush_pending(Program& program, uint32_t drawer) {
+  if (read8(kernel_.memory(), drawer + 0x24)) lyt_flush(program, drawer);
+}
+
+bool GfxNatives::lyt_material(Program& program, uint32_t function, uint32_t drawer, uint32_t material) {
+  // SetupGraphics 0x191c4c (docs/NSMB2-LYT.md §6)
+  Memory& m = kernel_.memory();
+  learn_lyt(branch_target(m, function + 0x78));
+  const uint32_t flags2c = m.read32(material + 0x2C), flags30 = m.read32(material + 0x30);
+  uint8_t mode = read8(m, drawer + 0x6A2);
+  if (read8(m, material + 0x4D) & 2) { // nothing to set
+    if (mode != 0 && mode != 1) lyt_flush_pending(program, drawer);
+    return true;
+  }
+  // not decoded yet: the game's own function
+  if ((flags2c & 0x400) || (flags30 & 0x1C0) || (flags30 & 3) == 3) return false;
+
+  bool barrier = false;
+  auto set_barrier = [&] {
+    barrier = true;
+    program.write(0x111, 1, 0); // [1][0x00000111]: no byte written
+  };
+  // alpha test
+  if (flags2c & 0x200) {
+    lyt_flush_pending(program, drawer);
+    write8(m, drawer + 0x6A1, 0);
+    set_barrier();
+    const uint32_t at = m.read32(material + 0x34) + (flags2c & 3) * 32 + (flags2c >> 2 & 3) * 20 + (flags2c >> 4 & 3) * 4;
+    const uint32_t table = literal(m, function + 0xA4); // lyt comparison → PICA
+    float ref;
+    const uint32_t ref_bits = m.read32(at + 4);
+    std::memcpy(&ref, &ref_bits, 4);
+    const uint32_t value = static_cast<uint32_t>(ref * 255.0f + 0.5f) & 0xFF;
+    program.write(0x104, m.read32(table + read8(m, at) * 4) << 4 | value << 8 | 1);
+  } else if (read8(m, drawer + 0x6A1) == 0) {
+    lyt_flush_pending(program, drawer);
+    write8(m, drawer + 0x6A1, 1);
+    set_barrier();
+    program.write(0x104, 0x61);
+  }
+  // blending (the custom one is left to the game above)
+  if (read8(m, drawer + 0x6A0) == 0) {
+    lyt_flush_pending(program, drawer);
+    write8(m, drawer + 0x6A0, 1);
+    if (!barrier) set_barrier();
+    commands(program, literal(m, function + 0x1D0), 0x10);
+  }
+  // TEV, by the number of textures
+  const uint32_t black = m.read32(material + 0x10), white = m.read32(material + 0x14);
+  const uint32_t t = literal(m, function + 0x224); // 0x5f4920: the templates
+  switch (flags30 & 3) {
+  case 0:
+    if (mode != 0) {
+      lyt_flush_pending(program, drawer);
+      m.write32(t + 0x20, white);
+      commands(program, t + 0x10, 0x18);
+      write8(m, drawer + 0x6A2, 0);
+    } else if (m.read32(t + 0x20) != white) {
+      lyt_flush_pending(program, drawer);
+      m.write32(t + 0x20, white);
+      program.write(0xFB, white);
+    }
+    break;
+  case 1:
+    if (mode != 1) {
+      lyt_flush_pending(program, drawer);
+      m.write32(t + 0x38, black);
+      m.write32(t + 0x50, white);
+      commands(program, t + 0x28, 0x48);
+      write8(m, drawer + 0x6A2, 1);
+    } else if (m.read32(t + 0x38) != black || m.read32(t + 0x50) != white) {
+      lyt_flush_pending(program, drawer);
+      m.write32(t + 0x38, black);
+      m.write32(t + 0x50, white);
+      program.write(0xDB, black);
+      program.write(0xF3, white);
+    }
+    break;
+  case 2: { // 0x192934
+    lyt_flush_pending(program, drawer);
+    const uint32_t mix = m.read32(material + 0x28);
+    if (mode != 2) {
+      m.write32(t + 0xE0, mix);
+      m.write32(t + 0xF8, white);
+      m.write32(t + 0x100, black);
+      commands(program, t + 0xD0, 0x58);
+    } else if (m.read32(t + 0xE0) != mix || m.read32(t + 0xF8) != white || m.read32(t + 0x100) != black) {
+      m.write32(t + 0xE0, mix);
+      m.write32(t + 0xF8, white);
+      m.write32(t + 0x100, black);
+      program.write(0xDB, mix);
+      program.write(0xF3, white);
+      program.write(0xFD, black);
+    }
+    write8(m, drawer + 0x6A2, 2);
+    break;
+  }
+  }
+  return true;
+}
+
+bool GfxNatives::lyt_textures(Program& program, uint32_t function, uint32_t drawer, uint32_t material, bool flag) {
+  // 0x1921d8 (docs/NSMB2-LYT.md §7)
+  Memory& m = kernel_.memory();
+  const uint32_t t = literal(m, function + 0x08); // 0x5f4990: the units' commands, 32 bytes each
+  if (material == 0) {
+    if (flag) return false; // textures off (0x1aa150): left to the game
+    m.write32(t + 0x08, 0), m.write32(t + 0x28, 0), m.write32(t + 0x48, 0);
+    return true;
+  }
+  learn_lyt(branch_target(m, function + 0xCC));
+  const bool none_pending = read8(m, drawer + 0x24) == 0;
+  const uint32_t n = std::min<uint32_t>(m.read32(material + 0x30) & 3, 3);
+  const uint32_t entries = m.read32(material + 0x34);
+  bool changed = false;
+  uint32_t mask = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    mask |= 1u << i;
+    const uint32_t e = entries + i * 32, u = t + i * 32;
+    const uint32_t address = m.read32(e + 4) >> 3, param = m.read32(e + 0x14);
+    if (m.read32(u + 8) != address || m.read32(u + 0x18) != param) {
+      changed = true;
+      m.write32(u + 0x00, m.read32(e + 0x18));
+      m.write32(u + 0x08, address);
+      m.write32(u + 0x10, m.read32(e + 0x1C));
+      m.write32(u + 0x18, param);
+    }
+  }
+  if (none_pending || changed) {
+    lyt_flush_pending(program, drawer);
+    commands(program, literal(m, function + 0xD0) + 0x10, 0x10); // a write to 0x080 with no byte
+  }
+  if (none_pending) {
+    program.write(0x6F, mask << 8, 0x2);
+    program.write(0x80, mask | 0x11000, 0xB);
+  }
+  if (none_pending || changed) program.write(0x80, mask | 0x11000, 0x4); // the texture cache cleared
+  if (changed) commands(program, t, 32 * n);
   return true;
 }
 
 bool GfxNatives::call(Thread& thread, uint32_t which) {
   ++calls_[which];
+  const uint32_t function = thread.ctx.r[15];
+  const uint32_t* r = thread.ctx.r;
+  Program program;
   bool done = false;
   switch (which) {
-  case kNngxCopyPreparedList:
-    // not native yet: the copy, then picanative reading it, as before; counted to see how much is left
+  case kNngxCopyPreparedList: // not native yet: the copy, then picanative reading it; counted
     break;
   case kLytFlushBatch:
-    done = lyt_flush(thread);
+    learn_lyt(function);
+    lyt_flush(program, r[0]);
+    done = true;
+    break;
+  case kLytMatrices: { // 0x1a98dc: the matrix and color rows alone
+    if (!lyt_.flush) break; // the cursor is learnt from the flush, the material or the textures first
+    Memory& m = kernel_.memory();
+    const uint32_t d = r[0], count = read8(m, d + 0x25);
+    std::vector<uint32_t> words(count * 4);
+    const uint32_t at = m.read32(d + 0x66C);
+    for (uint32_t i = 0; i < count * 4; ++i) words[i] = m.read32(at + i * 4);
+    program.uniforms(m.read32(d + 0x238) & 0x7F, words);
+    write8(m, d + 0x25, 0);
+    done = true;
+    break;
+  }
+  case kLytMaterial:
+    done = lyt_material(program, function, r[0], r[1]);
+    break;
+  case kLytTextures:
+    done = lyt_textures(program, function, r[0], r[1], r[2] != 0);
     break;
   default:
     break;
   }
-  if (done) ++done_[which];
+  if (done) {
+    emit(program);
+    ++done_[which];
+  }
   return done;
 }
 
