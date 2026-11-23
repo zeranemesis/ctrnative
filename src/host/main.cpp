@@ -489,11 +489,13 @@ int main(int argc, char** argv) {
               times[0], times[1], times[2], times[3], times[4], times[5], times[6]);
   {
     double t[4];
-    uint64_t calls[2] = {};
+    uint64_t calls[4] = {};
     pn_texture_times(engine, t, calls);
     std::printf("[host] textures: %llu lookups, %llu decoded; write-backs %.1f s, known %.1f s, hashing and decoding "
                 "%.1f s (of it decoding %.1f s)\n", static_cast<unsigned long long>(calls[0]),
                 static_cast<unsigned long long>(calls[1]), t[0], t[1], t[2], t[3]);
+    std::printf("[host] engine: %llu submits, %llu render passes\n", static_cast<unsigned long long>(calls[2]),
+                static_cast<unsigned long long>(calls[3]));
   }
   std::printf("[host] vertex programs: %llu translated ahead, %llu translated during the game (%.1f ms); "
               "pipelines %.1f s\n", static_cast<unsigned long long>(programs[0]),
