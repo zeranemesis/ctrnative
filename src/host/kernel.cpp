@@ -630,6 +630,11 @@ std::string Kernel::wait() {
 void Kernel::svc(Thread& self, uint32_t number) {
   Context& c = self.ctx;
   uint32_t* r = c.r;
+  if (number == 0xF0) { // the launcher's natives: the host's own work, no kernel state (they lock their own)
+    const bool taken = natives_ && natives_(self, r[12]);
+    if (!taken) r[12] = 0;
+    return;
+  }
   auto lock = this->lock();
   ++svc_sites_[{number, r[14]}];
   // the game's time moves on as it works; the host's natives (0xF0) cost it nothing: with or without them, the same run

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // The graphics libraries' functions done natively, in place of the PICA200 commands they would make (see
 // docs/RENDU-NATIF.md): the launcher finds them in a game's code by their bytes and replaces each with an override
@@ -10,6 +10,8 @@
 
 #include <picanative/api.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -114,25 +116,50 @@ private:
   // shortcut: never forgotten; menus animating make new ones for good, evict the unused if memory grows
   struct Op {
     std::vector<uint32_t> words;
-    uint32_t refs = 0, generation = 0;
+    uint32_t refs = 0, generation = 0; // refs: holders other than frames, and operations that run it
+    uint64_t frame = 0;                // the last frame a mark of it was made in (frames hold by this stamp)
     bool live = false;
+  };
+  struct WordsHash {
+    size_t operator()(const std::vector<uint32_t>& w) const {
+      uint64_t h = 0xCBF29CE484222325ull ^ w.size();
+      for (uint32_t x : w) h = (h ^ x) * 0x100000001B3ull;
+      return static_cast<size_t>(h);
+    }
   };
   std::vector<Op> ops_;        // by number - 1
   std::vector<uint32_t> free_; // numbers to use again
   size_t live_ = 0;
-  std::map<std::vector<uint32_t>, uint32_t> known_;
+  std::unordered_map<std::vector<uint32_t>, uint32_t, WordsHash> known_;
+  std::vector<uint32_t> program_buffer_; // reused, no allocation per call
   std::unordered_map<uint64_t, std::unordered_set<uint32_t>> holders_;
   uint64_t frame_ = 0;
   uint32_t recording_ = 0;     // the list nngx records, or 0
   std::recursive_mutex mutex_; // game threads call, picanative runs (an operation may run others)
-  std::map<uint32_t, uint64_t> calls_, done_;
+  static constexpr uint32_t kNatives = 64; // numbers below this
+  std::array<uint64_t, kNatives> calls_{}, done_{};
   uint64_t unknown_marks_ = 0;
-  // blocks translated once: (address, size) → their content's hash and operation (while it lives)
+  // CTRN_GFX_PROFILE
+  std::array<double, kNatives> prof_call_{};
+  double prof_run_ = 0, prof_lookup_ = 0, prof_translated_ = 0, prof_hashed_ = 0, prof_compare_ = 0,
+         prof_retranslate_ = 0;
+  uint64_t prof_runs_ = 0;
+  int run_depth_ = 0;
+  // blocks translated once: (address, size) â†’ their content's hash and operation (while it lives)
   struct Translated {
-    uint64_t hash = 0;
+    std::vector<uint8_t> bytes; // the block as translated: compared, not hashed, each time
     uint32_t id = 0, generation = 0;
   };
-  std::map<std::pair<uint32_t, uint32_t>, Translated> translated_;
+  struct PairHash {
+    size_t operator()(const std::pair<uint32_t, uint32_t>& p) const {
+      // splitmix64: every bit of the address and the size in the low bits the table uses
+      uint64_t x = (uint64_t{p.first} << 32 | p.second) + 0x9E3779B97F4A7C15ull;
+      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+      x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+      return static_cast<size_t>(x ^ (x >> 31));
+    }
+  };
+  std::unordered_map<std::pair<uint32_t, uint32_t>, Translated, PairHash> translated_;
   std::map<uint32_t, uint64_t> refused_copies_; // by size (bit 31: not translatable)
   uint64_t uncopied_words_ = 0, translated_words_ = 0, copied_words_ = 0;
 };

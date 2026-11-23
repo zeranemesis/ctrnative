@@ -484,6 +484,17 @@ int main(int argc, char** argv) {
   double times[7];
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
+  std::printf("[host] engine: recording draws %.1f s (textures %.1f s, pipelines %.1f s), encoding %.1f s, waiting for "
+              "the GPU %.1f s (storing to memory %.1f s), loading from memory %.1f s\n",
+              times[0], times[1], times[2], times[3], times[4], times[5], times[6]);
+  {
+    double t[4];
+    uint64_t calls[2] = {};
+    pn_texture_times(engine, t, calls);
+    std::printf("[host] textures: %llu lookups, %llu decoded; write-backs %.1f s, known %.1f s, hashing and decoding "
+                "%.1f s (of it decoding %.1f s)\n", static_cast<unsigned long long>(calls[0]),
+                static_cast<unsigned long long>(calls[1]), t[0], t[1], t[2], t[3]);
+  }
   std::printf("[host] vertex programs: %llu translated ahead, %llu translated during the game (%.1f ms); "
               "pipelines %.1f s\n", static_cast<unsigned long long>(programs[0]),
               static_cast<unsigned long long>(programs[1]), programs[2] / 1000.0, times[2]);

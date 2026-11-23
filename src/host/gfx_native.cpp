@@ -9,6 +9,17 @@ namespace host {
 
 namespace {
 
+// CTRN_GFX_PROFILE: where the natives' time goes (host side when called, picanative side when run)
+const bool kProfile = std::getenv("CTRN_GFX_PROFILE") != nullptr;
+struct Clocked {
+  double& total;
+  std::chrono::steady_clock::time_point start;
+  explicit Clocked(double& t) : total(t), start(kProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+  ~Clocked() {
+    if (kProfile) total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  }
+};
+
 const char* name(uint32_t which) {
   switch (which) {
   case GfxNatives::kNngxCopyPreparedList: return "nngx: a prepared list copied into the current one";
@@ -117,11 +128,22 @@ GfxNatives::GfxNatives(Kernel& kernel, pn_engine* engine) : kernel_(kernel), eng
 void GfxNatives::run(void* self, uint32_t operation) {
   auto& natives = *static_cast<GfxNatives*>(self);
   std::lock_guard lock(natives.mutex_);
+  const bool outer = natives.run_depth_++ == 0;
+  struct Depth {
+    int& d;
+    ~Depth() { --d; }
+  } depth{natives.run_depth_};
+  double ignored = 0;
+  Clocked clocked(outer ? natives.prof_run_ : ignored);
+  ++natives.prof_runs_;
   if (operation == 0 || operation > natives.ops_.size() || !natives.ops_[operation - 1].live) {
     ++natives.unknown_marks_;
     return;
   }
-  const std::vector<uint32_t> w = natives.ops_[operation - 1].words; // a copy: a nested one may free others
+  // no copy: nothing is freed while an operation runs (the lock is held, a nested run only runs)
+  const std::vector<uint32_t>& w = natives.ops_[operation - 1].words;
+  pn_run_program(natives.engine_, w.data(), static_cast<uint32_t>(w.size()));
+  return;
   for (size_t i = 0; i + 1 < w.size();) {
     if (w[i] >> 31) {
       const uint32_t first = w[i] >> 8 & 0x7F, count = w[i] & 0xFF;
@@ -138,7 +160,12 @@ void GfxNatives::run(void* self, uint32_t operation) {
 // the operations a program's marks name (a block translated with marks in it)
 template <typename F> static void each_nested(const std::vector<uint32_t>& w, F f) {
   for (size_t i = 0; i + 1 < w.size();) {
-    if (w[i] >> 31) {
+    if ((w[i] >> 30) == 3) { // one register, many values
+      const uint32_t count = w[i + 1];
+      if ((w[i] & 0xFFFF) == 0x2F0)
+        for (uint32_t k = 0; k < count && i + 2 + k < w.size(); ++k) f(w[i + 2 + k]);
+      i += 2 + count;
+    } else if (w[i] >> 31) {
       i += 1 + (w[i] & 0xFF) * 4;
     } else {
       if ((w[i] & 0xFFFF) == 0x2F0) f(w[i + 1]);
@@ -148,6 +175,7 @@ template <typename F> static void each_nested(const std::vector<uint32_t>& w, F 
 }
 
 uint32_t GfxNatives::operation(const Program& program) {
+  Clocked clocked(prof_lookup_);
   // one done before (most of a menu, every frame): its operation again
   if (const auto found = known_.find(program.words); found != known_.end()) return found->second;
   uint32_t id;
@@ -156,6 +184,7 @@ uint32_t GfxNatives::operation(const Program& program) {
   Op& op = ops_[id - 1];
   op.words = program.words;
   op.refs = 0;
+  op.frame = frame_; // a new one lives at least through this frame
   op.live = true;
   each_nested(op.words, [&](uint32_t inner) {
     if (inner && inner <= ops_.size() && ops_[inner - 1].live) ++ops_[inner - 1].refs;
@@ -172,6 +201,10 @@ uint64_t GfxNatives::holder() const {
 
 void GfxNatives::hold(uint64_t who, uint32_t id) {
   if (!id || id > ops_.size() || !ops_[id - 1].live) return;
+  if (who >> 62 == 1) { // a frame's lists: a stamp, no set (most marks are these)
+    ops_[id - 1].frame = frame_;
+    return;
+  }
   if (holders_[who].insert(id).second) ++ops_[id - 1].refs;
 }
 
@@ -184,7 +217,9 @@ void GfxNatives::release(uint64_t who) {
 }
 
 void GfxNatives::unref(uint32_t id) {
-  if (!id || id > ops_.size() || !ops_[id - 1].live || --ops_[id - 1].refs) return;
+  if (!id || id > ops_.size() || !ops_[id - 1].live) return;
+  if (ops_[id - 1].refs) --ops_[id - 1].refs;
+  if (ops_[id - 1].refs || ops_[id - 1].frame + 8 > frame_) return; // still held, or marked in a recent frame
   Op& op = ops_[id - 1];
   op.live = false;
   ++op.generation;
@@ -200,7 +235,14 @@ void GfxNatives::frame() {
   std::lock_guard lock(mutex_);
   // a frame's lists are done with a few frames on (GSP runs them in order, the window shows the last ones)
   ++frame_;
-  if (frame_ >= 8) release(uint64_t{1} << 62 | (frame_ - 8));
+  // what only frames held, and none of the last 8: freed (a scan of the operations, a few thousand)
+  for (uint32_t id = 1; id <= ops_.size(); ++id) {
+    const Op& op = ops_[id - 1];
+    if (op.live && op.refs == 0 && op.frame + 8 <= frame_) {
+      ++ops_[id - 1].refs; // unref takes it back to 0 and frees it
+      unref(id);
+    }
+  }
 }
 
 uint32_t GfxNatives::mark_at(uint32_t where, uint32_t operation, uint64_t who) {
@@ -243,8 +285,15 @@ bool GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
       continue;
     }
     if (reg + (consecutive ? extra : 0) >= 0x238 && reg <= 0x23D) return false;
-    for (uint32_t k = 0; k <= extra; ++k)
-      program.write(consecutive ? reg + k : reg, k == 0 ? first : m.read32(address + (i + 1 + k) * 4), mask);
+    if (consecutive || extra == 0) {
+      for (uint32_t k = 0; k <= extra; ++k)
+        program.write(consecutive ? reg + k : reg, k == 0 ? first : m.read32(address + (i + 1 + k) * 4), mask);
+    } else { // one register, many values: data of uniforms, program code, a table, in one step
+      program.words.push_back(0xC0000000u | mask << 16 | reg);
+      program.words.push_back(extra + 1);
+      program.words.push_back(first);
+      for (uint32_t k = 1; k <= extra; ++k) program.words.push_back(m.read32(address + (i + 1 + k) * 4));
+    }
     i += 2 + extra;
     i += i & 1;
   }
@@ -459,23 +508,25 @@ bool GfxNatives::lyt_begin(Program& program, uint32_t function, uint32_t drawer,
 }
 
 uint32_t GfxNatives::translated(uint32_t address, uint32_t size) {
+  Clocked clocked(prof_translated_);
+  prof_hashed_ += size;
   // a block of commands kept in memory (a model's, a recorded list): translated once, again only if it changed
   Memory& m = kernel_.memory();
   if (size < 8 || !m.host(address) || !m.host(address + size - 1)) return 0;
   const uint8_t* bytes = m.fastmem() + address; // the game's own view: its addresses, in order
-  uint64_t hash = 0xCBF29CE484222325ull;
-  for (uint32_t i = 0; i + 8 <= size; i += 8) {
-    uint64_t w;
-    std::memcpy(&w, bytes + i, 8);
-    hash = (hash ^ w) * 0x100000001B3ull;
-  }
   auto& known = translated_[{address, size}];
   const bool alive = known.id && known.id <= ops_.size() && ops_[known.id - 1].live &&
                      ops_[known.id - 1].generation == known.generation;
-  if (known.hash != hash || !alive) {
+  bool same;
+  {
+    Clocked compare(prof_compare_);
+    same = alive && known.bytes.size() == size && std::memcmp(known.bytes.data(), bytes, size) == 0;
+  }
+  if (!same) {
+    Clocked again(prof_retranslate_);
     Program block;
     if (!commands(block, address, size) || block.words.empty()) return 0;
-    known.hash = hash;
+    known.bytes.assign(bytes, bytes + size);
     known.id = operation(block);
     known.generation = ops_[known.id - 1].generation;
     translated_words_ += size / 4;
@@ -628,6 +679,8 @@ bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address,
 
 bool GfxNatives::call(Thread& thread, uint32_t which) {
   std::lock_guard lock(mutex_);
+  which &= kNatives - 1; // the counters are arrays: no lookup per call
+  Clocked clocked(prof_call_[which]);
   ++calls_[which];
   // CTRN_NO_NATIVES=3,17: those left to the game's own code (to find which one draws wrong)
   static const std::vector<uint32_t> off = [] {
@@ -880,11 +933,24 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
 }
 
 void GfxNatives::report() const {
-  for (const auto& [which, n] : calls_) {
-    const auto done = done_.find(which);
-    std::printf("[gfx] %s: %llu calls, %llu done natively\n", name(which), static_cast<unsigned long long>(n),
-                static_cast<unsigned long long>(done == done_.end() ? 0 : done->second));
+  if (kProfile) {
+    double calls = 0;
+    for (double t : prof_call_) calls += t;
+    std::printf("[gfx] profile: host side %.3f s (of it: block lookups %.3f s, translated blocks %.3f s, %.1f MB hashed),"
+                " run side %.3f s for %llu runs; %.1f MB translated, %zu blocks known; compare %.3f s, retranslate %.3f s\n",
+                calls, prof_lookup_,
+                prof_translated_, prof_hashed_ / 1e6, prof_run_, static_cast<unsigned long long>(prof_runs_),
+                static_cast<double>(translated_words_) * 4 / 1e6, translated_.size(), prof_compare_, prof_retranslate_);
+    std::vector<std::pair<double, uint32_t>> rows;
+    for (uint32_t which = 0; which < kNatives; ++which) rows.emplace_back(prof_call_[which], which);
+    std::sort(rows.rbegin(), rows.rend());
+    for (const auto& [t, which] : rows)
+      if (t > 0.01) std::printf("[gfx] profile:   %6.3f s  %s\n", t, name(which));
   }
+  for (uint32_t which = 0; which < kNatives; ++which)
+    if (calls_[which])
+      std::printf("[gfx] %s: %llu calls, %llu done natively\n", name(which),
+                  static_cast<unsigned long long>(calls_[which]), static_cast<unsigned long long>(done_[which]));
   for (const auto& [size, n] : refused_copies_)
     std::printf("[gfx] %s left to the game: %u bytes%s, %llu times\n", size >> 30 == 1 ? "words written around" : "copy into the list",
                 size & 0x3FFFFFFF, size >> 31 ? " (not translatable)" : "", static_cast<unsigned long long>(n));
