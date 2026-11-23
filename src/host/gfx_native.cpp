@@ -123,6 +123,10 @@ struct GfxNatives::Program {
 
 GfxNatives::GfxNatives(Kernel& kernel, pn_engine* engine) : kernel_(kernel), engine_(engine) {
   pn_set_native_operations(engine_, &GfxNatives::run, this);
+  // where nngx keeps the next command's place: the launcher read it in nngxAdd3DCommand's code; not guessed from
+  // a native's own code (a function matching only in part read it at a wrong place: Mario Kart 7 broke)
+  if (const char* cursor = std::getenv("CTRN_COMMAND_CURSOR"))
+    lyt_.cursor = static_cast<uint32_t>(std::strtoul(cursor, nullptr, 16));
 }
 
 void GfxNatives::run(void* self, uint32_t operation) {
@@ -304,7 +308,7 @@ void GfxNatives::learn_lyt(uint32_t flush) {
   if (lyt_.flush) return;
   const Memory& m = kernel_.memory();
   lyt_.flush = flush;
-  lyt_.cursor = literal(m, flush + 0x18);                            // ldr r6, =cursor
+  if (!lyt_.cursor) lyt_.cursor = literal(m, flush + 0x18);          // ldr r6, =cursor
   lyt_.draw_block = literal(m, branch_target(m, flush + 0x164));     // bl → ldr r0, =block
 }
 
@@ -656,6 +660,9 @@ bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address,
   // nngxAdd3DCommand 0x5407e4: the block's commands become an operation. Copied, they are read now; not copied (a
   // request of its own: a model's commands, prepared once), translated once and kept while the block is unchanged
   Memory& m = kernel_.memory();
+  // not copied: the SDK makes a request of its own (and keeps its books on it); skipping that broke Mario Kart 7 at
+  // its start. Left to the game until those books are done natively too.
+  if (!copy) return false;
   if (!copy) {
     const uint32_t cursor_at = literal(m, function + 0x10);
     if (!lyt_.cursor) lyt_.cursor = cursor_at;
@@ -670,10 +677,19 @@ bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address,
   }
   const uint32_t cursor_at = literal(m, function + 0x10);
   if (!lyt_.cursor) lyt_.cursor = cursor_at;
-  if (cursor_at != lyt_.cursor || !commands(program, address, size)) return false;
+  if (cursor_at != lyt_.cursor) return false;
+  // the block's place in the list, as the game's copy takes it (it moves on by size & ~3): the mark and a padding
+  // there, never less (a caller may count on where its block ends)
+  const uint32_t cursor = m.read32(cursor_at), end = m.read32(cursor_at + 4), advance = size & ~3u;
+  if (advance < 8 || (advance & 7) || cursor > end || advance > end - cursor) return false;
+  const uint32_t id = translated(address, advance);
+  if (!id) return false;
   // what it keeps: the current list's used size, before the block
   const uint32_t list = m.read32(literal(m, function + 0x0C) + 0x9C);
-  m.write32(list + 0xC, m.read32(cursor_at) - m.read32(list + 4));
+  m.write32(list + 0xC, cursor - m.read32(list + 4));
+  pad(mark_at(cursor, id), advance / 4 - 2);
+  m.write32(cursor_at, cursor + advance);
+  program.words.clear();
   return true;
 }
 
@@ -812,7 +828,10 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     break;
   case kAroundFirst + 6: { // 0x11efd8(where, block): 312 bytes copied (an unrolled copy), the end returned
     Memory& m = kernel_.memory();
-    if (!lyt_.cursor || r[0] - m.read32(lyt_.cursor) >= 0x10000) break;
+    // inside the current list only, from the cursor to its end (nngx keeps the end in the word after the cursor)
+    if (!lyt_.cursor) break;
+    const uint32_t cursor = m.read32(lyt_.cursor), end = m.read32(lyt_.cursor + 4);
+    if (r[0] < cursor || r[0] >= end || 312 > end - r[0]) break;
     done = list_copy(r[0], r[1], 312);
     if (done) thread.ctx.r[0] = r[0] + 312;
     break;

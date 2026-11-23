@@ -18,7 +18,9 @@ HERE = Path(__file__).resolve().parent
 
 def run(rom, cache, out, frames, every, off, extra_env):
     out.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, CTRN_HEADLESS="1", CTRN_FIXED_STEP="1", CTRN_FRAMES=str(frames),
+    # CTRN_ALL_NATIVES: every native found in the module (the ones not checked on this game yet too), so both runs
+    # use the same module; the second leaves some to the game at run time (CTRN_NO_NATIVES)
+    env = dict(os.environ, CTRN_ALL_NATIVES="1", CTRN_HEADLESS="1", CTRN_FIXED_STEP="1", CTRN_FRAMES=str(frames),
                CTRN_SHOT_EVERY=str(every), CTRN_SHOT_DIR=str(out), CTRN_USER_DIR=str(out / "user"), **extra_env)
     env.pop("CTRN_NO_NATIVES", None)
     if off:
