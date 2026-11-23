@@ -31,6 +31,8 @@ public:
     kLytDrawBegin = 9,
     kLytDrawEnd = 10,
     kLytBeginProjected = 11,
+    kNngxAdd3DCommand = 12,
+    kNngxAddBlock = 13,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -57,6 +59,7 @@ private:
   void lyt_flush(Program& program, uint32_t drawer);
   void lyt_flush_pending(Program& program, uint32_t drawer);
   bool lyt_material(Program& program, uint32_t function, uint32_t drawer, uint32_t material);
+  bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);
   bool lyt_begin(Program& program, uint32_t function, uint32_t drawer, uint32_t flag);
   bool lyt_textures(Program& program, uint32_t function, uint32_t drawer, uint32_t material, bool flag);

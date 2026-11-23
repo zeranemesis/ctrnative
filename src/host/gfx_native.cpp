@@ -20,6 +20,8 @@ const char* name(uint32_t which) {
   case GfxNatives::kLytDrawBegin: return "nw::lyt: drawing begun";
   case GfxNatives::kLytDrawEnd: return "nw::lyt: drawing ended";
   case GfxNatives::kLytBeginProjected: return "nw::lyt: drawing begun with a projection";
+  case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
+  case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   default: return "?";
   }
 }
@@ -257,8 +259,14 @@ bool GfxNatives::lyt_textures(Program& program, uint32_t function, uint32_t draw
   Memory& m = kernel_.memory();
   const uint32_t t = literal(m, function + 0x08); // 0x5f4990: the units' commands, 32 bytes each
   if (material == 0) {
-    if (flag) return false; // textures off (0x1aa150): left to the game
     m.write32(t + 0x08, 0), m.write32(t + 0x28, 0), m.write32(t + 0x48, 0);
+    if (flag) { // 0x1aa150: the units off
+      const uint32_t off = branch_target(m, function + 0x1A0);
+      if (!lyt_.cursor) lyt_.cursor = literal(m, off);
+      program.write(0x6F, 0, 0x2);
+      commands(program, literal(m, off + 0x24), 0x10); // a write to 0x080 with no byte
+      program.write(0x80, 0x1000, 0xB);
+    }
     return true;
   }
   learn_lyt(branch_target(m, function + 0xCC));
@@ -320,6 +328,19 @@ bool GfxNatives::lyt_begin(Program& program, uint32_t function, uint32_t drawer,
   return true;
 }
 
+bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy) {
+  // nngxAdd3DCommand 0x5407e4: copied, the block's commands become an operation (a request of its own is left)
+  if (!copy) return false;
+  Memory& m = kernel_.memory();
+  const uint32_t cursor_at = literal(m, function + 0x10);
+  if (!lyt_.cursor) lyt_.cursor = cursor_at;
+  if (cursor_at != lyt_.cursor || !commands(program, address, size)) return false;
+  // what it keeps: the current list's used size, before the block
+  const uint32_t list = m.read32(literal(m, function + 0x0C) + 0x9C);
+  m.write32(list + 0xC, m.read32(cursor_at) - m.read32(list + 4));
+  return true;
+}
+
 bool GfxNatives::call(Thread& thread, uint32_t which) {
   ++calls_[which];
   const uint32_t function = thread.ctx.r[15];
@@ -349,6 +370,14 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kLytMaterial:
     done = lyt_material(program, function, r[0], r[1]);
     break;
+  case kNngxAdd3DCommand:
+    done = nngx_add(program, function, r[0], r[1], r[2] != 0);
+    break;
+  case kNngxAddBlock: { // 0x5407cc, then 0x5407e4 18 bytes on
+    Memory& m = kernel_.memory();
+    done = nngx_add(program, function + 0x18, m.read32(r[0]), m.read32(r[0] + 4), read8(m, r[0] + 0xC) != 0);
+    break;
+  }
   case kLytDrawBegin:
     done = lyt_begin(program, function, r[0], r[1]);
     break;

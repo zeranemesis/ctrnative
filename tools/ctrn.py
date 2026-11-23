@@ -354,6 +354,12 @@ GFX_NATIVES = [
     (11, "nw::lyt (NSMB2's drawer): drawing begun with a projection",
      [0xE92D4070, 0xE1A04000, 0xE5900000, 0xE1A05001, 0xE3A01000, 0xE590200C, 0xE1A00004, 0xE12FFF32,
       0xE2851004, 0xE1A00004, 0xE8BD4070, 0xE1A00000, 0xE92D4010, 0xE1A04000, 0xE2800034, 0xEBFDCB3D]),
+    (12, "nngx: a block of commands added, copied or not (SDK 2012)",
+     [0xE92D41F0, 0xE1A06001, 0xE1A08000, 0xE59F50C4, 0xE59F70C4, 0xE3520000, 0xE595409C, 0xE5970000,
+      0xE5941004, 0xE0401001, 0xE584100C, 0x0A000007, 0xE1A02006, 0xE1A01008, 0xEBEF5172, 0xE5970000]),
+    (13, "nngx: a block {address, size, copied} added (SDK 2012)",
+     [0xE5D0100C, 0xE3510000, 0x13A02001, 0x03A02000, 0xE1C000D0, 0xE1A00000, 0xE92D41F0, 0xE1A06001,
+      0xE1A08000, 0xE59F50C4, 0xE59F70C4, 0xE3520000, 0xE595409C, 0xE5970000, 0xE5941004, 0xE0401001]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}
