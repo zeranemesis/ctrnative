@@ -1,4 +1,4 @@
-"""Runs a 3DS game natively: python tools/ctrn.py <decrypted rom.3ds> [options]
+﻿"""Runs a 3DS game natively: python tools/ctrn.py <decrypted rom.3ds> [options]
 The first run translates the game's code with 3dsrecomp and compiles it (a few minutes);
 the module is kept in a cache, by title ID and code, for the next runs.
 Options:
@@ -785,6 +785,7 @@ def main():
     module = game / ("module.dll" if os.name == "nt" else "module.so")
 
     hints = game / "hints.txt"  # function starts 3dsrecomp cannot find, one address a line
+    modules_dir = game / "modules"  # modules the game unpacked itself, saved by the host when it loaded them
 
     def build():
         recomp = shutil.which(args.recomp) or args.recomp
@@ -799,7 +800,10 @@ def main():
         for old in [*(game / "recomp").glob("code_*.c"), *(game / "recomp" / "hand").glob("*.c")]:
             old.unlink()
         overrides = ["--overrides", str(natives_dir)] if (natives_dir / "gfx_natives.c").is_file() else []
-        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides], check=True)
+        # modules the game loaded that its RomFS has not as files (saved by the host when it met them)
+        modules = ["--modules", str(modules_dir)] if any(modules_dir.glob("*.cro")) else []
+        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides, *modules],
+                       check=True)
         translated = time.monotonic()
         print(f"[ctrn] translated in {translated - start:.0f} s; compiling it (a few minutes the first time)", flush=True)
         subprocess.run([sys.executable, str(HERE / "build_module.py"), str(game / "recomp"), str(module),
@@ -865,17 +869,25 @@ def main():
     if not dump.is_file() and not stand_in.is_file():
         subprocess.run([sys.executable, str(HERE / "shared_font.py"), str(stand_in)], check=True)
     env.setdefault("CTRN_SHARED_FONT", str(dump if dump.is_file() else stand_in))
+    env["CTRN_MODULES_DIR"] = str(modules_dir)
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:
     # that address becomes a hint, the module is rebuilt (only what changed) and the game starts again
-    for attempt in range(20):
+    for attempt in range(80):  # each new hint or module costs a rebuild and a fresh start
         run = subprocess.Popen([str(args.host), str(module), str(rom)], env=env, stdout=subprocess.PIPE,
                                text=True, errors="replace")
         missing = None
+        saved = None
         for line in run.stdout:
             print(line, end="", flush=True)
             if m := re.search(r"stopped after \d+ frames: no recompiled code at ([0-9a-f]{8})", line):
                 missing = int(m.group(1), 16)
+            if m := re.search(r"stopped after \d+ frames: module (\S+) saved for translation", line):
+                saved = m.group(1)
         code_returned = run.wait()
+        if saved is not None:
+            print(f"[ctrn] module {saved}: translating it with the others, rebuilding", flush=True)
+            build()
+            continue
         if missing is None or not text_start <= missing < text_start + text_pages * 0x1000:
             sys.exit(code_returned)
         if missing in [int(word, 16) for word in hints.read_text().split()]:

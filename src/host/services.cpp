@@ -194,6 +194,9 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
     case 0x0814: case 0x0815: case 0x0849: reply(c, command, {0x200, 0x4000, 0x80000, 0x80000}); return true;
     case 0x0817: case 0x0818: case 0x0821: case 0x083D: reply(c, command, {1}); return true;
     case 0x0862: fs_priority_ = c[1], reply(c, command); return true;
+    // GetThisSaveDataSecureValue(slot): the save's anti-rollback value; none was ever set here (a new save):
+    // exists 0, not a game card's, value 0
+    case 0x086F: reply(c, command, {0, 0, 0, 0}); return true;
     case 0x080C: { // OpenArchive(archive, path type, path size, <path>)
       uint32_t path[3] = {};
       kernel.memory().read(c[5], path, std::min<uint32_t>(c[3], sizeof path));
@@ -250,11 +253,20 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       kernel.memory().read(c[10], archive_path, std::min<uint32_t>(c[4], sizeof archive_path));
       kernel.memory().read(c[12], file_path, std::min<uint32_t>(c[6], sizeof file_path));
       if (c[2] == 3) { // SelfNCCH, the game itself: its 12-byte binary file path as OpenFile's below
-        if (c[5] != 2 || c[6] != 12) return false;
+        if (c[5] != 2 || c[6] != 12) {
+          std::printf("[host] fs: SelfNCCH opened with file path type %u size %u (%08x %08x %08x %08x %08x), archive "
+                      "path type %u size %u\n", c[5], c[6], file_path[0], file_path[1], file_path[2], file_path[3],
+                      file_path[4], c[3], c[4]);
+          return false;
+        }
         char exefs_name[9] = {};
         std::memcpy(exefs_name, file_path + 1, 8);
         HostFile rom;
-        if (!section_in_rom(file_path[0], exefs_name, rom)) return false;
+        if (!section_in_rom(file_path[0], exefs_name, rom)) {
+          std::printf("[host] fs: SelfNCCH section %08x (%08x %08x) not in the ROM\n", file_path[0], file_path[1],
+                      file_path[2]);
+          return false;
+        }
         const uint32_t id = next_file_++;
         files_[id] = rom;
         auto session = std::make_shared<Session>(Object::Kind::Session, "FSFile");
@@ -266,6 +278,12 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       // gives: the Mii data an empty CFL_Res.dat (titles start, with no Mii to draw);
       // shortcut: the region manifest and the bad word list come as empty files, build them if a game reads them
       // the media type is the low byte (titles leave the rest unset)
+      // a title's add-on content (0004008C) not installed: not found, as for a player without the DLC (Smash
+      // looks for it at its start and goes on without)
+      if (c[2] == 0x2345678A && archive_path[1] == 0x0004008C) {
+        c[0] = header(command, 1, 0), c[1] = 0xC8804478; // FS: not found
+        return true;
+      }
       if (c[2] != 0x2345678A || (archive_path[2] & 0xFF) != 0 || file_path[0] != 0) {
         std::printf("[host] fs: a system file not native yet: archive %08x path %08x %08x %08x %08x, file %08x %08x %08x\n",
                     c[2], archive_path[0], archive_path[1], archive_path[2], archive_path[3], file_path[0], file_path[1],
@@ -693,6 +711,9 @@ bool Services::ldr_ro(Kernel& kernel, uint32_t* c) {
     const uint32_t source = c[1], address = c[2], size = c[3], data = c[4], data_size = c[6], bss = c[7];
     const uint32_t bss_size = c[8], fix_level = c[10];
     const bool auto_link = (c[9] & 0xFF) != 0;
+    // the module as the game hands it, before ldr:ro links it: kept to be translated if it has no code yet
+    std::vector<uint8_t> original(size);
+    m.read(source, original.data(), size);
     uint32_t base = source;
     if (address && address != source && !(address & 0xFFF)) {
       if (const uint32_t physical = kernel.allocate(Kernel::kSystem, pages(size), false)) {
@@ -733,8 +754,21 @@ bool Services::ldr_ro(Kernel& kernel, uint32_t* c) {
       }
     }
     const std::string& name = cro_->last().name;
-    if (!module || !module->place(name, base))
+    if (!module || !module->place(name, base)) {
       std::printf("[host] ldr:ro: %s loaded at %08x has no translated code: it cannot run\n", name.c_str(), base);
+      // a module the RomFS has not as a .cro file (packed, unpacked by the game): saved as the game handed it, the
+      // launcher translates it with the others (3dsrecomp --modules) and starts the game again
+      if (const char* dir = std::getenv("CTRN_MODULES_DIR")) {
+        const std::filesystem::path path = std::filesystem::path(dir) / (name + ".cro");
+        std::error_code ignored;
+        if (!std::filesystem::exists(path, ignored)) {
+          std::filesystem::create_directories(dir, ignored);
+          std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(original.data()),
+                                                      static_cast<std::streamsize>(original.size()));
+          kernel.stop("module " + name + " saved for translation");
+        }
+      }
+    }
     static const bool log = std::getenv("CTRN_LOG_CRO") != nullptr;
     if (log) std::printf("[host] ldr:ro: %s at %08x, %x bytes, fixed to %x\n", name.c_str(), base, size, fixed);
     static std::set<std::string> said;
@@ -1080,7 +1114,9 @@ bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
       }
     return false;
   }
-  if (kind != 0) return false;
+  // 5: the update's RomFS (a patch title installed apart); a cartridge's revision has none, its own RomFS is the
+  // game's current data (Smash Rev 5 asks for it first)
+  if (kind != 0 && kind != 5) return false;
   const uint64_t ivfc = ncch + uint64_t{u32(0x1B0)} * 0x200, size = uint64_t{u32(0x1B4)} * 0x200;
   if (!in.seekg(static_cast<std::streamoff>(ivfc)).read(reinterpret_cast<char*>(h), 0x60) || std::memcmp(h, "IVFC", 4)) return false;
   const uint32_t master = u32(0x08), log2 = u32(0x4C);

@@ -83,8 +83,13 @@ void save_screen(pn_engine* engine, host::Memory& memory, const pn_screen& s, co
 #if defined(_WIN32)
 // a crash nothing else caught (a decompiled function run without the check):
 // the faulting module and offset, for llvm-objdump on that DLL
+const host::Module* g_crash_module = nullptr; // to name the guest function a crash is in
+
 LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
   void* pc = e->ExceptionRecord->ExceptionAddress;
+  if (g_crash_module)
+    if (const uint32_t guest = g_crash_module->guest_function(pc))
+      std::fprintf(stderr, "[host] crash in the guest function %08x\n", guest);
   HMODULE module = nullptr;
   char name[MAX_PATH] = "?";
   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -225,6 +230,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", error.c_str());
     return 2;
   }
+#if defined(_WIN32)
+  g_crash_module = &module;
+#endif
 
   // the engine draws from the game's physical memory, and owns the window
   char message[512] = {};
