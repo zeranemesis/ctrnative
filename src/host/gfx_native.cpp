@@ -22,6 +22,8 @@ const char* name(uint32_t which) {
   case GfxNatives::kLytBeginProjected: return "nw::lyt: drawing begun with a projection";
   case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
+  case GfxNatives::kViewport: return "NSMB2: a viewport set";
+  case GfxNatives::kScissor: return "NSMB2: a scissor set";
   default: return "?";
   }
 }
@@ -41,6 +43,26 @@ uint8_t read8(const Memory& m, uint32_t at) {
   return b;
 }
 void write8(Memory& m, uint32_t at, uint8_t b) { m.write(at, &b, 1); }
+
+// NSMB2's float conversions for the PICA (0x488da4): 1.7.16 and 1.7.23, exponent bias 63, too small = signed zero
+uint32_t float24(float f) {
+  uint32_t b;
+  std::memcpy(&b, &f, 4);
+  const uint32_t sign = b >> 31;
+  if ((b & 0x7FFFFFFF) == 0) return sign << 23;
+  const int32_t exponent = static_cast<int32_t>(b << 1 >> 24) - 0x40;
+  if (exponent < 0) return sign << 23;
+  return (b << 9 >> 16) | static_cast<uint32_t>(exponent) << 16 | sign << 23;
+}
+uint32_t float31(float f) {
+  uint32_t b;
+  std::memcpy(&b, &f, 4);
+  const uint32_t sign = b >> 31;
+  if ((b & 0x7FFFFFFF) == 0) return sign << 30;
+  const int32_t exponent = static_cast<int32_t>(b << 1 >> 24) - 0x40;
+  if (exponent < 0) return sign << 30;
+  return (b << 9 >> 9) | static_cast<uint32_t>(exponent) << 23 | sign << 30;
+}
 
 } // namespace
 
@@ -91,6 +113,13 @@ uint32_t GfxNatives::operation(const Program& program) {
     it->second = static_cast<uint32_t>(operations_.size());
   }
   return it->second;
+}
+
+uint32_t GfxNatives::mark_at(uint32_t where, uint32_t operation) {
+  Memory& m = kernel_.memory();
+  m.write32(where, operation);
+  m.write32(where + 4, 0x000F0000u | 0x2F0u);
+  return where + 8;
 }
 
 void GfxNatives::emit(Program& program) {
@@ -404,6 +433,38 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kNngxAddBlock: { // 0x5407cc, then 0x5407e4 18 bytes on
     Memory& m = kernel_.memory();
     done = nngx_add(program, function + 0x18, m.read32(r[0]), m.read32(r[0] + 4), read8(m, r[0] + 0xC) != 0);
+    break;
+  }
+  case kViewport: { // 0x488da4(rect {x, y, w, h}, where): the viewport's commands, written at `where`
+    if (!lyt_.cursor) break; // the cursor learnt first (the words go into the current list)
+    Memory& m = kernel_.memory();
+    const uint32_t x = m.read32(r[0]), y = m.read32(r[0] + 4), w = m.read32(r[0] + 8), h = m.read32(r[0] + 0xC);
+    program.write(0x41, float24(static_cast<float>(w) * 0.5f), 0x7);
+    program.write(0x42, float31(2.0f / static_cast<float>(w)) << 1);
+    program.write(0x43, float24(static_cast<float>(h) * 0.5f), 0x7);
+    program.write(0x44, float31(2.0f / static_cast<float>(h)) << 1);
+    program.write(0x68, x | y << 16);
+    thread.ctx.r[0] = mark_at(r[1], operation(program));
+    program.words.clear();
+    done = true;
+    break;
+  }
+  case kScissor: { // 0x4883d0(scissor {on, x, y, w, h, buffer w, buffer h}, where)
+    if (!lyt_.cursor) break;
+    Memory& m = kernel_.memory();
+    const uint32_t s = r[0];
+    const int32_t x = static_cast<int32_t>(m.read32(s + 4)), y = static_cast<int32_t>(m.read32(s + 8));
+    const int32_t right = x + static_cast<int32_t>(m.read32(s + 0xC)) - 1;
+    const int32_t top = y + static_cast<int32_t>(m.read32(s + 0x10)) - 1;
+    const int32_t bw = static_cast<int32_t>(m.read32(s + 0x14)), bh = static_cast<int32_t>(m.read32(s + 0x18));
+    const uint32_t x0 = x < 0 ? 0 : static_cast<uint32_t>(bw <= x ? bw - 1 : x);
+    const uint32_t y0 = y < 0 ? 0 : static_cast<uint32_t>(bh <= y ? bh - 1 : y);
+    program.write(0x65, read8(m, s) ? 3 : 0);
+    program.write(0x66, y0 << 16 | x0);
+    program.write(0x67, right < 0 ? 0 : static_cast<uint32_t>(right) | static_cast<uint32_t>(top < 0 ? 0 : top) << 16);
+    thread.ctx.r[0] = mark_at(r[1], operation(program));
+    program.words.clear();
+    done = true;
     break;
   }
   case kLytDrawBegin:

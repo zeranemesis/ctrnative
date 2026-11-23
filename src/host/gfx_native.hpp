@@ -33,6 +33,8 @@ public:
     kLytBeginProjected = 11,
     kNngxAdd3DCommand = 12,
     kNngxAddBlock = 13,
+    kViewport = 14,
+    kScissor = 15,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -48,6 +50,8 @@ private:
   uint32_t operation(const Program& program);
   // the program as an operation, marked at the game's command cursor
   void emit(Program& program);
+  // an operation's mark written at `where` (a place the game reserved in its list); the word after it
+  uint32_t mark_at(uint32_t where, uint32_t operation);
   // what a block of commands the game keeps sets; false if it runs other lists
   bool commands(Program& program, uint32_t address, uint32_t bytes);
 
