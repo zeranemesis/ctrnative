@@ -9,10 +9,11 @@ par [picanative](https://github.com/zeranemesis/picanative) (WebGPU).
 Ce dépôt ne contient rien d'un jeu : chacun fournit sa propre ROM décryptée,
 dont il a le droit de faire une copie.
 
-**État : un premier jeu tourne sans rien de propre à lui** (Super Mario 3D
-Land : de l'introduction à la carte du monde 1, avec un module traduit sans
-aucun remplacement de fonction). Les étapes suivantes : le lanceur, les mods,
-un deuxième jeu, voir [docs/PLAN.md](docs/PLAN.md).
+**État : un premier jeu démarre sans rien de propre à lui** (Super Mario 3D
+Land, lancé depuis sa seule ROM : de l'introduction à la carte du monde 1).
+Rien n'est encore vérifié au-delà : ni un niveau joué, ni le son, ni la
+vitesse en fenêtre. La suite, en commençant par des essais qui se rejouent
+seuls : [docs/PLAN.md](docs/PLAN.md).
 
 ## Principes
 
