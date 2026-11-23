@@ -424,6 +424,12 @@ GFX_NATIVES = [
      [0xE92D0E30, 0xE8B1003C, 0xF5D1F040, 0xE8B11E00, 0xE8A0003C, 0xE8A01E00, 0xE8B1003C, 0xF5D1F040, 0xE8B11E00, 0xE8A0003C, 0xE8A01E00, 0xE8B1003C]),
     (38, "nngx: the list split (SDK 2012) (translated around)",
      [0xE92D41F0, 0xE59F5190, 0xE59F0190, 0xE595409C, 0xE5901000, 0xE5942004, 0xE0412002, 0xE584200C, 0xE5943014, 0xE1530002, 0x0A00005A, 0xE59F3170]),
+    (39, "nw::gfx: a light's parameters set (translated around)",
+     [0xE92D00F0, 0xE3A0C000, 0xE5913000, 0xE59F4110, 0xE5912004, 0xE2135102, 0xE1A06483, 0xE1A07083, 0xE1A064A6, 0x13A05902, 0xE3D33102, 0xE1A07C27]),
+    (40, "nw::gfx: fog set (translated around)",
+     [0xE92D4070, 0xE59000A0, 0xE3500000, 0x0A00005B, 0xE5901008, 0xEDDF0A5A, 0xE3A00000, 0xE28130C4, 0xED911A2D, 0xE591C0C4, 0xED9F0A56, 0xEEB41AE0]),
+    (41, "NSMB2: an effect's matrix set (translated around)",
+     [0xE92D4070, 0xE1A05001, 0xE1A04002, 0xE59F10A0, 0xE3A02F52, 0xE1A00005, 0xEBF28D0C, 0xE59F0098, 0xE59F3090, 0xE3A02000, 0xE5850154, 0xE5852150]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8, 30, 36}
@@ -431,7 +437,7 @@ AFTER_NATIVES = {8, 30, 36}
 LIST_COPY_NATIVES = {16, 17, 18}
 # natives around the game's function: it runs, then the host takes what it wrote at the cursor (r2: where the cursor
 # was, r3: where it is) as one operation; the game's code computes, the host sets, picanative reads nothing there
-AROUND_NATIVES = set(range(31, 39)) - {36, 37}
+AROUND_NATIVES = (set(range(31, 39)) - {36, 37}) | {39, 40, 41}
 NNGX_ADD_3D_COMMAND = 12  # its literal at +0x10 is that place's address
 
 

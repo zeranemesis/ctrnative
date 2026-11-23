@@ -33,6 +33,9 @@ const char* name(uint32_t which) {
   case GfxNatives::kAroundFirst + 5: return "NSMB2: a render target (translated after)";
   case GfxNatives::kAroundFirst + 6: return "nw::gfx: a 312-byte block copied";
   case GfxNatives::kAroundFirst + 7: return "nngx: the list split, around";
+  case GfxNatives::kAroundFirst + 8: return "nw::gfx: a light's parameters, around";
+  case GfxNatives::kAroundFirst + 9: return "nw::gfx: fog, around";
+  case GfxNatives::kAroundFirst + 10: return "NSMB2: an effect's matrix, around";
   case GfxNatives::kGameDraw: return "NSMB2: an indexed draw";
   case GfxNatives::kGameVertexFormat: return "NSMB2: a vertex format set (translated after)";
   case GfxNatives::kGfxCamera: return "nw::gfx: a camera's matrices sent";
@@ -763,6 +766,7 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   }
   case kAroundFirst + 0: case kAroundFirst + 1: case kAroundFirst + 2: case kAroundFirst + 3:
   case kAroundFirst + 4: case kAroundFirst + 7:
+  case kAroundFirst + 8: case kAroundFirst + 9: case kAroundFirst + 10:
     // what the game's function just wrote at the cursor, [r2, r3): an operation of the frame (or the recording)
     if (!lyt_.cursor) lyt_.cursor = 0; // the cursor's place is in the generated code; the words are where they are
     done = r[3] != r[2] && written(r[2], r[3], 0);

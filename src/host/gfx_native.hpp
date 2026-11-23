@@ -53,7 +53,7 @@ public:
     kGfxVec4 = 28,
     kGameDraw = 29,
     kGameVertexFormat = 30, // after the game's function
-    kAroundFirst = 31,      // 31-38: around the game's function (tools/ctrn.py AROUND_NATIVES)
+    kAroundFirst = 31,      // 31-41: around the game's function (tools/ctrn.py AROUND_NATIVES)
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
