@@ -366,9 +366,33 @@ GFX_NATIVES = [
     (15, "NSMB2: a scissor's commands written",
      [0xE92D0030, 0xE2802004, 0xE280300C, 0xE8921004, 0xE8930018, 0xE5D05000, 0xE0822003, 0xE08C3004,
       0xE3550000, 0xE2434001, 0xE242C001, 0xE59F2078, 0x13A03003, 0x03A03000, 0xE4813004, 0xE4812004]),
+    # the C library's copies (the ARM compiler's runtime): a block copied into the command list becomes its
+    # operation (translated once, checked by its content), the rest copies as before without asking the host
+    (16, "__aeabi_memcpy (unaligned): a block copied into the command list",
+     [0xE3520008, 0x8A00002F, 0x0A000029, 0xE3520004, 0x8A00000D, 0x0A000019, 0xE3520002, 0x3A000005,
+      0x0A000013, 0xE0D120B2, 0xE4D13001, 0xE0C020B2]),
+    (17, "__aeabi_memcpy4: a block copied into the command list",
+     [0xE92D47F0, 0xE2522020, 0x3A000009, 0xE8B10078, 0xF5D1F040, 0xE8B10780, 0xE8A00078, 0xE2522020,
+      0xE8A00780, 0x28B10078, 0xF5D1F040, 0x28B10780]),
+    (18, "__aeabi_memcpy: a block copied into the command list",
+     [0xE3520003, 0x9A000017, 0xE210C003, 0x0A000008, 0xE4D13001, 0xE35C0002, 0xE082200C, 0x94D1C001,
+      0xE4C03001, 0x34D13001, 0x94C0C001, 0xE2422004]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}
+# copies: the host is asked only when the destination is where the game's next command goes
+LIST_COPY_NATIVES = {16, 17, 18}
+NNGX_ADD_3D_COMMAND = 12  # its literal at +0x10 is that place's address
+
+
+def command_cursor(found, code, base):
+    """the address of the word nngx keeps the next command's place in, read from nngxAdd3DCommand's code"""
+    for address, number, _ in found:
+        if number == NNGX_ADD_3D_COMMAND:
+            at = address + 0x10 - base
+            word = struct.unpack_from("<I", code, at)[0]
+            return struct.unpack_from("<I", code, at + 8 + (word & 0xFFF))[0]
+    return None
 
 
 def instruction_mask(word):
@@ -393,11 +417,25 @@ def gfx_natives(code, base):
     return found
 
 
-def natives_source(found):
+def natives_source(found, cursor=None):
     """the overrides that hand each found function to the host (svc 0xF0, r12: its number); the host says no by
     setting r12 to 0, and the game's own function runs"""
     out = ['#include "overrides.h"\n']
     for address, number, what in found:
+        if number in LIST_COPY_NATIVES:
+            if cursor is None:
+                continue
+            out.append(f"/* {what} */\n"
+                       f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                       f"    if (ctx->r[0] == mem_read32_in(FASTMEM(ctx), 0x{cursor:08X}u) && ctx->r[2] >= 16 &&\n"
+                       f"        !(ctx->r[2] & 7)) {{\n"
+                       f"        ctx->r[12] = {number}u;\n"
+                       f"        SVC(0x{address:08X}u, 0xF0u);\n"
+                       f"        if (ctx->r[12] != 0) RETURN_TO(ctx->r[14]);\n"
+                       f"    }}\n"
+                       f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                       f"}}\n")
+            continue
         if number in AFTER_NATIVES:
             out.append(f"/* {what} */\n"
                        f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
@@ -484,7 +522,7 @@ def main():
     found = gfx_natives(code, text_start)
     natives_changed = False
     if found:
-        source = natives_source(found)
+        source = natives_source(found, command_cursor(found, code, text_start))
         natives_dir.mkdir(exist_ok=True)
         old = (natives_dir / "gfx_natives.c").read_text() if (natives_dir / "gfx_natives.c").is_file() else ""
         if old != source:

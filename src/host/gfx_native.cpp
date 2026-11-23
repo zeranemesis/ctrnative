@@ -23,6 +23,9 @@ const char* name(uint32_t which) {
   case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   case GfxNatives::kViewport: return "NSMB2: a viewport set";
+  case GfxNatives::kCopyUnaligned: return "__aeabi_memcpy (unaligned): a block copied into the list";
+  case GfxNatives::kCopyAligned: return "__aeabi_memcpy4: a block copied into the list";
+  case GfxNatives::kCopy: return "__aeabi_memcpy: a block copied into the list";
   case GfxNatives::kScissor: return "NSMB2: a scissor set";
   default: return "?";
   }
@@ -141,6 +144,11 @@ bool GfxNatives::commands(Program& program, uint32_t address, uint32_t bytes) {
     const uint32_t reg = header & 0xFFFF, mask = header >> 16 & 0xF, extra = header >> 20 & 0xFF;
     const bool consecutive = header >> 31;
     if (reg >= 0x300) break; // the list is over
+    if (reg == 0x2F1) { // a padding of ours, where a block was: nothing
+      i += 2 + extra;
+      i += i & 1;
+      continue;
+    }
     if (reg + (consecutive ? extra : 0) >= 0x238 && reg <= 0x23D) return false;
     for (uint32_t k = 0; k <= extra; ++k)
       program.write(consecutive ? reg + k : reg, k == 0 ? first : m.read32(address + (i + 1 + k) * 4), mask);
@@ -357,6 +365,45 @@ bool GfxNatives::lyt_begin(Program& program, uint32_t function, uint32_t drawer,
   return true;
 }
 
+uint32_t GfxNatives::translated(uint32_t address, uint32_t size) {
+  // a block of commands kept in memory (a model's, a recorded list): translated once, again only if it changed
+  Memory& m = kernel_.memory();
+  if (size < 8 || !m.host(address) || !m.host(address + size - 1)) return 0;
+  const uint8_t* bytes = m.fastmem() + address; // the game's own view: its addresses, in order
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (uint32_t i = 0; i + 8 <= size; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, bytes + i, 8);
+    hash = (hash ^ w) * 0x100000001B3ull;
+  }
+  auto& known = translated_[{address, size}];
+  if (known.first != hash || known.second == 0) {
+    Program block;
+    if (!commands(block, address, size) || block.words.empty()) return 0;
+    known = {hash, operation(block)};
+    translated_words_ += size / 4;
+  }
+  return known.second;
+}
+
+bool GfxNatives::list_copy(uint32_t destination, uint32_t source, uint32_t size) {
+  // a block copied where the game's next command goes: its mark, then a padding picanative skips, as long as the
+  // block (the caller moves on by its size)
+  const uint32_t operation = translated(source, size);
+  if (!operation) return false;
+  Memory& m = kernel_.memory();
+  uint32_t at = mark_at(destination, operation), left = size / 4 - 2;
+  while (left) {
+    const uint32_t extra = std::min<uint32_t>(left - 2, 254);
+    m.write32(at, 0);
+    m.write32(at + 4, 0x2F1u | extra << 20);
+    at += (2 + extra) * 4;
+    left -= 2 + extra;
+  }
+  copied_words_ += size / 4;
+  return true;
+}
+
 bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy) {
   // nngxAdd3DCommand 0x5407e4: the block's commands become an operation. Copied, they are read now; not copied (a
   // request of its own: a model's commands, prepared once), translated once and kept while the block is unchanged
@@ -435,6 +482,11 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     done = nngx_add(program, function + 0x18, m.read32(r[0]), m.read32(r[0] + 4), read8(m, r[0] + 0xC) != 0);
     break;
   }
+  case kCopyUnaligned:
+  case kCopyAligned:
+  case kCopy:
+    done = list_copy(r[0], r[1], r[2]);
+    break;
   case kViewport: { // 0x488da4(rect {x, y, w, h}, where): the viewport's commands, written at `where`
     if (!lyt_.cursor) break; // the cursor learnt first (the words go into the current list)
     Memory& m = kernel_.memory();
@@ -544,6 +596,8 @@ void GfxNatives::report() const {
     std::printf("[gfx] %s: %llu calls, %llu done natively\n", name(which), static_cast<unsigned long long>(n),
                 static_cast<unsigned long long>(done == done_.end() ? 0 : done->second));
   }
+  if (copied_words_)
+    std::printf("[gfx] blocks copied into lists: %llu words, as marks\n", static_cast<unsigned long long>(copied_words_));
   if (uncopied_words_)
     std::printf("[gfx] blocks run where they are: %llu words, %llu of them translated\n",
                 static_cast<unsigned long long>(uncopied_words_), static_cast<unsigned long long>(translated_words_));

@@ -35,6 +35,9 @@ public:
     kNngxAddBlock = 13,
     kViewport = 14,
     kScissor = 15,
+    kCopyUnaligned = 16, // copies: asked only for a block copied where the next command goes
+    kCopyAligned = 17,
+    kCopy = 18,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -63,6 +66,9 @@ private:
   void lyt_flush(Program& program, uint32_t drawer);
   void lyt_flush_pending(Program& program, uint32_t drawer);
   bool lyt_material(Program& program, uint32_t function, uint32_t drawer, uint32_t material);
+  // a block in memory as an operation, translated once (0: not one)
+  uint32_t translated(uint32_t address, uint32_t size);
+  bool list_copy(uint32_t destination, uint32_t source, uint32_t size);
   bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);
   bool lyt_begin(Program& program, uint32_t function, uint32_t drawer, uint32_t flag);
@@ -78,7 +84,7 @@ private:
   uint64_t unknown_marks_ = 0;
   // blocks not copied, translated once: (address, size) → (content hash, operation)
   std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint32_t>> translated_;
-  uint64_t uncopied_words_ = 0, translated_words_ = 0;
+  uint64_t uncopied_words_ = 0, translated_words_ = 0, copied_words_ = 0;
 };
 
 } // namespace host
