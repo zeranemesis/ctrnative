@@ -1023,6 +1023,12 @@ void Kernel::svc(Thread& self, uint32_t number) {
     r[0] = kOk, r[1] = static_cast<uint32_t>(value), r[2] = static_cast<uint32_t>(value >> 32);
     break;
   }
+  case 0xF0: { // not the console's: a native the launcher's overrides hand a library function to (r12: which one)
+    // r12 back to 0: not taken (yet), the override runs the game's own function
+    const bool taken = natives_ && natives_(self, r[12]);
+    if (!taken) r[12] = 0;
+    break;
+  }
   case 0x35: // GetProcessId -> 0x22
     r[0] = kOk, r[1] = 0x22;
     break;

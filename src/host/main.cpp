@@ -3,6 +3,7 @@
 // usage: ctrnative <module> <rom.3ds>  (or <module> <code.bin> <exheader.bin>)
 // CTRN_HEADLESS=1: no window; CTRN_FRAMES=n: stop after n frames.
 #include "dsp.hpp"
+#include "gfx_native.hpp"
 #include "gsp.hpp"
 #include "kernel.hpp"
 #include "memory.hpp"
@@ -257,6 +258,8 @@ int main(int argc, char** argv) {
 
   host::Kernel kernel(memory, module);
   if (host::trace::on()) host::trace::start(module);
+  host::GfxNatives gfx_natives(kernel);
+  kernel.set_natives([&](host::Thread& thread, uint32_t which) { return gfx_natives.call(thread, which); });
   host::Services services;
   services.module = &module;
   services.program_id = uint64_t{u32(exheader, 0x200)} | uint64_t{u32(exheader, 0x204)} << 32;
@@ -423,6 +426,7 @@ int main(int argc, char** argv) {
   }
   const std::string why = kernel.wait();
   if (host::trace::on()) host::trace::report();
+  gfx_natives.report();
   audio.join();
   if (wav.is_open()) {
     const uint32_t rate = 32728, bytes = static_cast<uint32_t>(wav_samples * 4);

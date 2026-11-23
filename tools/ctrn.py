@@ -317,6 +317,56 @@ def extract_shaders(rom, code, folder):
           f"{'...' if len(places) > 8 else ''}", flush=True)
 
 
+# the graphics libraries' functions done natively instead of making PICA200 commands (docs/RENDU-NATIF.md): the
+# number the host knows each by (src/host/gfx_native.hpp), what it is, and its first instructions; a pc-relative load's
+# offset and a branch's target are left out, as they move from one build to the next
+GFX_NATIVES = [
+    (1, "nngx: a prepared list copied into the current one (SDK 2012)",
+     [0xE92D4FFF, 0xE200201F, 0xE24DD004, 0xE3A04000, 0xE3A09001, 0xE59F1000, 0xE59D8038, 0xE59DB040,
+      0xE0812102, 0xE591609C, 0xE59F1000, 0xE592701C, 0xE5915000, 0xE3570000, 0x0A000000, 0xE5971000]),
+]
+
+
+def instruction_mask(word):
+    if word & 0x0F7F0000 == 0x051F0000:  # ldr rN, [pc, #i]
+        return 0xFFFFF000
+    if word & 0x0E000000 == 0x0A000000:  # b, bl
+        return 0xFF000000
+    return 0xFFFFFFFF
+
+
+def gfx_natives(code, base):
+    """where each of GFX_NATIVES is in the code: (address, number, what)"""
+    words = struct.unpack_from(f"<{len(code) // 4}I", code)
+    found = []
+    for number, what, signature in GFX_NATIVES:
+        masks = [instruction_mask(w) for w in signature]
+        first, mask0 = signature[0] & masks[0], masks[0]
+        for i in range(len(words) - len(signature)):
+            if words[i] & mask0 == first and all(words[i + k] & masks[k] == signature[k] & masks[k]
+                                                 for k in range(1, len(signature))):
+                found.append((base + i * 4, number, what))
+    return found
+
+
+def natives_source(found):
+    """the overrides that hand each found function to the host (svc 0xF0, r12: its number); the host says no by
+    setting r12 to 0, and the game's own function runs"""
+    out = ['#include "overrides.h"\n']
+    for address, number, what in found:
+        out.append(f"/* {what} */\n"
+                   f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                   f"    ctx->r[12] = {number}u;\n"
+                   f"    SVC(0x{address:08X}u, 0xF0u);\n"
+                   f"    if (ctx->r[12] == 0) {{\n"
+                   f"        CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                   f"        return;\n"
+                   f"    }}\n"
+                   f"    RETURN_TO(ctx->r[14]);\n"
+                   f"}}\n")
+    return "\n".join(out)
+
+
 def default_cache():
     base = os.environ.get("LOCALAPPDATA")
     return Path(base) / "ctrnative" if base else Path.home() / ".cache" / "ctrnative"
@@ -349,7 +399,8 @@ def main():
         # link twice; build_module keeps the objects by content, so nothing compiled is lost
         for old in (game / "recomp").glob("code_*.c"):
             old.unlink()
-        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints)], check=True)
+        overrides = ["--overrides", str(natives_dir)] if (natives_dir / "gfx_natives.c").is_file() else []
+        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides], check=True)
         translated = time.monotonic()
         print(f"[ctrn] translated in {translated - start:.0f} s; compiling it (a few minutes the first time)", flush=True)
         subprocess.run([sys.executable, str(HERE / "build_module.py"), str(game / "recomp"), str(module),
@@ -369,7 +420,19 @@ def main():
               f"{len(new)} new hints", flush=True)
         with hints.open("a") as f:
             f.write("".join(f"{a:08X}\n" for a in new))
-    if new or not module.is_file():
+    # the graphics functions done natively: a change of them (a new one known) makes the module again
+    natives_dir = game / "natives"
+    found = gfx_natives(code, text_start)
+    natives_changed = False
+    if found:
+        source = natives_source(found)
+        natives_dir.mkdir(exist_ok=True)
+        old = (natives_dir / "gfx_natives.c").read_text() if (natives_dir / "gfx_natives.c").is_file() else ""
+        if old != source:
+            (natives_dir / "gfx_natives.c").write_text(source)
+            natives_changed = True
+        print(f"[ctrn] graphics natives: {', '.join(f'{a:08X} ({n})' for a, n, _ in found)}", flush=True)
+    if new or natives_changed or not module.is_file():
         build()
     # the GPU programs, translated ahead (picanative loads them at start); again when picanative changes
     shaders, translator = game / "shaders", args.host.parent / ("pn_shaders.exe" if os.name == "nt" else "pn_shaders")

@@ -37,6 +37,12 @@ std::unordered_set<uintptr_t> g_watched;           // host pages made read-only
 std::unordered_map<uintptr_t, Writer> g_writers;   // host address of a word -> who wrote it last
 std::map<Writer, uint64_t> g_counts;               // words sent to the GPU, by writer
 uint64_t g_words = 0;
+// CTRN_TRACE_WATCH=address:size,...: more places to watch, the lists a game prepares and copies into the ones it
+// sends (NSMB2's nngx lists); the words written there are counted by writer too
+std::unordered_set<uintptr_t> g_source_pages;
+std::map<Writer, uint64_t> g_source_counts;
+uint64_t g_source_words = 0;
+bool g_sources_armed = false;
 
 #if defined(_WIN32)
 thread_local std::vector<void*> t_reprotect;
@@ -81,9 +87,14 @@ LONG WINAPI fault(EXCEPTION_POINTERS* e) {
     {
       // the words of the page the step changed are this writer's
       std::lock_guard<std::mutex> lock(g_mutex);
-      for (const auto& [page, bytes] : t_before)
+      for (const auto& [page, bytes] : t_before) {
+        const bool source = g_source_pages.count(page) != 0;
         for (uint32_t i = 0; i < 0x1000; i += 4)
-          if (std::memcmp(reinterpret_cast<const void*>(page + i), bytes.data() + i, 4)) g_writers[page + i] = t_writer;
+          if (std::memcmp(reinterpret_cast<const void*>(page + i), bytes.data() + i, 4)) {
+            g_writers[page + i] = t_writer;
+            if (source) ++g_source_counts[t_writer], ++g_source_words;
+          }
+      }
     }
     for (void* page : t_reprotect) VirtualProtect(page, 0x1000, PAGE_READONLY, &old);
     t_reprotect.clear(), t_before.clear();
@@ -135,6 +146,25 @@ void start(const Module& module) {
 void submitted(Memory& memory, uint32_t address, uint32_t size) {
 #if defined(_WIN32)
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_sources_armed) { // once the game sends lists, the places it prepares them in are mapped
+    g_sources_armed = true;
+    for (const char* p = std::getenv("CTRN_TRACE_WATCH"); p && *p;) {
+      char* end;
+      const uint32_t start = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+      const uint32_t bytes = *end == ':' ? static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)) : 0;
+      for (uint32_t a = start & ~0xFFFu; a < start + bytes; a += 0x1000) {
+        if (!memory.host(a)) continue;
+        const uintptr_t page = reinterpret_cast<uintptr_t>(memory.fastmem() + a);
+        g_source_pages.insert(page);
+        if (!g_watched.insert(page).second) continue;
+        DWORD old;
+        VirtualProtect(reinterpret_cast<void*>(page), 0x1000, PAGE_READONLY, &old);
+      }
+      std::printf("[trace] watching %08x, %x bytes\n", start, bytes);
+      p = *end == ',' ? end + 1 : end;
+      if (end == p && *p) break;
+    }
+  }
   std::vector<uintptr_t> pages;
   for (uint32_t i = 0; i + 4 <= size; i += 4) {
     // the game's own view of its memory (fastmem): where its code writes, so where a protection traps it; the
@@ -179,6 +209,21 @@ void report() {
   std::printf("[trace] %llu command words sent; by the function that wrote them:\n", static_cast<unsigned long long>(g_words));
   for (size_t i = 0; i < top.size() && i < 20; ++i)
     std::printf("[trace]   %5.1f %%  %s\n", g_words ? 100.0 * top[i].first / g_words : 0.0, name(top[i].second).c_str());
+  if (g_source_pages.empty()) return;
+  // the watched places (CTRN_TRACE_WATCH): next to the table, <file>.sources.csv
+  std::vector<std::pair<uint64_t, Writer>> sources;
+  for (const auto& [w, n] : g_source_counts) sources.emplace_back(n, w);
+  std::sort(sources.begin(), sources.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  if (const char* path = std::getenv("CTRN_TRACE_CMDS")) {
+    std::ofstream out(std::string(path) + ".sources.csv");
+    out << "words,writer,caller,caller2,caller3,caller4,caller5\n";
+    for (const auto& [n, w] : sources) {
+      out << n;
+      for (uint32_t fn : w.fn) out << ',' << name(fn);
+      out << '\n';
+    }
+  }
+  std::printf("[trace] %llu words written in the watched places\n", static_cast<unsigned long long>(g_source_words));
 }
 
 } // namespace host::trace

@@ -122,6 +122,10 @@ public:
   std::string wait();
 
   void set_services(ServiceHandler handler) { services_ = std::move(handler); }
+  // the natives library functions are replaced by (svc 0xF0 from the launcher's overrides, see docs/RENDU-NATIF.md):
+  // true when one took the call (its results in the registers), false to run the game's own function
+  using NativeHandler = std::function<bool(Thread&, uint32_t which)>;
+  void set_natives(NativeHandler handler) { natives_ = std::move(handler); }
   // what the game asked of the 3DS system: svcs by number and return address,
   // service requests by service and command (what is left to make native)
   void report() const;
@@ -175,6 +179,7 @@ private:
   const Module& module_;
   Host host_{};
   ServiceHandler services_;
+  NativeHandler natives_;
 
   std::mutex mutex_;
   std::condition_variable wake_timekeeper_, finished_;
