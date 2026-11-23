@@ -25,6 +25,8 @@ const char* name(uint32_t which) {
   case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   case GfxNatives::kViewport: return "NSMB2: a viewport set";
+  case GfxNatives::kGameDraw: return "NSMB2: an indexed draw";
+  case GfxNatives::kGameVertexFormat: return "NSMB2: a vertex format set (translated after)";
   case GfxNatives::kGfxCamera: return "nw::gfx: a camera's matrices sent";
   case GfxNatives::kGfxRows3: return "nw::gfx: a 3x4 matrix sent";
   case GfxNatives::kGfxRows4: return "nw::gfx: a 4x4 matrix sent";
@@ -192,7 +194,15 @@ void GfxNatives::frame() {
 
 uint32_t GfxNatives::mark_at(uint32_t where, uint32_t operation, uint64_t who) {
   Memory& m = kernel_.memory();
-  hold(who ? who : holder(), operation);
+  if (who == kAtItsPlace) { // kept while the mark is there: a buffer the game builds once and runs many times
+    who = uint64_t{4} << 62 | where;
+    hold(who | uint64_t{1} << 61, operation); // the new one first: the same operation there again stays
+    release(who);
+    holders_[who] = std::move(holders_[who | uint64_t{1} << 61]);
+    holders_.erase(who | uint64_t{1} << 61);
+  } else {
+    hold(who ? who : holder(), operation);
+  }
   m.write32(where, operation);
   m.write32(where + 4, 0x000F0000u | 0x2F0u); // the mark: one register, all bytes
   return where + 8;
@@ -523,6 +533,28 @@ bool GfxNatives::palette_rows(uint32_t where, uint32_t source, bool first, uint3
   return true;
 }
 
+void GfxNatives::pad(uint32_t at, uint32_t words) {
+  // what follows a mark up to the end of the place the game's words took: skipped unread (words even, >= 0)
+  Memory& m = kernel_.memory();
+  while (words) {
+    const uint32_t extra = std::min<uint32_t>(words - 2, 254);
+    m.write32(at, 0);
+    m.write32(at + 4, 0x2F1u | extra << 20);
+    at += (2 + extra) * 4;
+    words -= 2 + extra;
+  }
+}
+
+bool GfxNatives::written(uint32_t start, uint32_t end) {
+  // a game function's commands, just written at [start, end): as an operation, its mark and a padding in their place
+  // (the game computed the values, its own code; the host sets them, picanative reads nothing there)
+  if (end <= start || ((end - start) & 7) || end - start > 0x4000) return false;
+  const uint32_t id = translated(start, end - start);
+  if (!id) return false;
+  pad(mark_at(start, id, kAtItsPlace), (end - start) / 4 - 2);
+  return true;
+}
+
 bool GfxNatives::uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3) {
   // nw::gfx's uniform writers (0x11d7d0 3 rows, 0x11d854 4 rows, 0x11d8a0 a vec3): the caller put the index command
   // at the cursor, they write the data after it. Taken when the whole is one command here: the rows from their
@@ -687,6 +719,29 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     if (done) thread.ctx.r[0] = r[0] + 24; // where it stopped: the caller's next command goes there
     break;
   }
+  case kGameDraw: { // NSMB2 0x487e00(?, where, {indices, count, 8-bit}): an indexed draw, 18 words at `where`
+    Memory& m = kernel_.memory();
+    const uint32_t d = r[2], base = m.read32(literal(m, function + 0x14)); // the attribute buffers' base, / 8
+    const uint32_t indices = m.read32(d) - base * 8;
+    program.write(0x25F, 1);
+    program.write(0x227, (read8(m, d + 8) ? 0u : 0x80000000u) | indices);
+    program.write(0x228, m.read32(d + 4));
+    program.write(0x245, 0, 0x1);
+    program.write(0x22F, 1);
+    program.write(0x245, 1, 0x1);
+    program.write(0x231, 1);
+    program.write(0x25E, 0, 0x8);
+    program.write(0x25E, 0, 0x8);
+    const uint32_t id = operation(program);
+    program.words.clear();
+    pad(mark_at(r[1], id, kAtItsPlace), 16);
+    thread.ctx.r[0] = r[1] + 0x48;
+    done = true;
+    break;
+  }
+  case kGameVertexFormat: // after NSMB2 0x487ea0(layout, where): what it wrote, up to where it stopped (r3)
+    done = written(r[1], r[3]);
+    break;
   case kViewport: { // 0x488da4(rect {x, y, w, h}, where): the viewport's commands, written at `where`
     if (!lyt_.cursor) break; // the cursor learnt first (the words go into the current list)
     Memory& m = kernel_.memory();
@@ -696,7 +751,7 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     program.write(0x43, float24(static_cast<float>(h) * 0.5f), 0x7);
     program.write(0x44, float31(2.0f / static_cast<float>(h)) << 1);
     program.write(0x68, x | y << 16);
-    thread.ctx.r[0] = mark_at(r[1], operation(program));
+    thread.ctx.r[0] = mark_at(r[1], operation(program), kAtItsPlace);
     program.words.clear();
     done = true;
     break;
@@ -714,7 +769,7 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     program.write(0x65, read8(m, s) ? 3 : 0);
     program.write(0x66, y0 << 16 | x0);
     program.write(0x67, right < 0 ? 0 : static_cast<uint32_t>(right) | static_cast<uint32_t>(top < 0 ? 0 : top) << 16);
-    thread.ctx.r[0] = mark_at(r[1], operation(program));
+    thread.ctx.r[0] = mark_at(r[1], operation(program), kAtItsPlace);
     program.words.clear();
     done = true;
     break;

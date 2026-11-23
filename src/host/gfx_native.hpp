@@ -51,6 +51,8 @@ public:
     kNngxClear = 26,
     kGfxRows3Data = 27,
     kGfxVec4 = 28,
+    kGameDraw = 29,
+    kGameVertexFormat = 30, // after the game's function
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -69,6 +71,8 @@ private:
   // the program as an operation, marked at the game's command cursor
   void emit(Program& program);
   // an operation's mark written at `where` (a place the game reserved in its list); the word after it
+  // holder 0: what marks now (the frame, or the list being recorded); kAtItsPlace: the place itself
+  static constexpr uint64_t kAtItsPlace = ~uint64_t{0};
   uint32_t mark_at(uint32_t where, uint32_t operation, uint64_t holder = 0);
   // who keeps operations alive: a frame's lists, a recorded list, a text's list; one lives while one holds it
   uint64_t holder() const;
@@ -95,6 +99,8 @@ private:
     std::vector<uint32_t> words;
   } palette_;
   bool palette_rows(uint32_t where, uint32_t source, bool first, uint32_t header);
+  void pad(uint32_t at, uint32_t words);
+  bool written(uint32_t start, uint32_t end);
   bool uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3);
   bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);

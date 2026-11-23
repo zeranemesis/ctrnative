@@ -404,9 +404,13 @@ GFX_NATIVES = [
      [0xECB10A0C, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xEDC01A00, 0xED802A07, 0xEDC02A06, 0xED803A05, 0xEDC03A04, 0xED804A0B, 0xEDC04A0A, 0xED805A09, 0xEDC05A08, 0xE12FFF1E]),
     (28, "nw::gfx: a vec4 written after its index command",
      [0xECB10A04, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xEDC01A00, 0xE12FFF1E]),
+    (29, "NSMB2: an indexed draw's commands written",
+     [0xE92D00F0, 0xE3A03001, 0xE5D20008, 0xE59F6080, 0xE3500000, 0xE59F0074, 0x13A05000, 0x03A05102, 0xE2464038, 0xE590C000, 0xE5920000, 0xE8810048, 0xE26CC000, 0xE080C18C, 0xE2810008, 0xE185700C]),
+    (30, "NSMB2: a vertex format's commands written (translated after)",
+     [0xE92D4FF0, 0xE24DD05C, 0xE1A08000, 0xE1A03001, 0xE3A02000, 0xE59FC4FC, 0xE59F04FC, 0xE59F54FC, 0xE5A1C004, 0xE2816004, 0xE2811008, 0xE28D7024, 0xE8810005, 0xE2811004, 0xE0854840, 0xE58D1004]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
-AFTER_NATIVES = {8}
+AFTER_NATIVES = {8, 30}
 # copies: the host is asked only when the destination is where the game's next command goes
 LIST_COPY_NATIVES = {16, 17, 18}
 NNGX_ADD_3D_COMMAND = 12  # its literal at +0x10 is that place's address
@@ -468,7 +472,7 @@ def natives_source(found, cursor=None):
                        f"    const uint32_t a0 = ctx->r[0], a1 = ctx->r[1], a2 = ctx->r[2], a3 = ctx->r[3];\n"
                        f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
                        f"    const uint32_t back = ctx->r[15] | (ctx->thumb ? 1u : 0u), result = ctx->r[0];\n"
-                       f"    ctx->r[0] = a0, ctx->r[1] = a1, ctx->r[2] = a2, ctx->r[3] = a3;\n"
+                       f"    ctx->r[0] = a0, ctx->r[1] = a1, ctx->r[2] = a2, ctx->r[3] = result; (void)a3;\n"
                        f"    ctx->r[12] = {number}u;\n"
                        f"    SVC(0x{address:08X}u, 0xF0u);\n"
                        f"    ctx->r[0] = result;\n"
