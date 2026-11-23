@@ -22,6 +22,10 @@ public:
   uint32_t entry_count() const { return count_; }
   // a CRO module ldr:ro loaded at base (0: unloaded): its translated code runs there; false when there is none
   bool place(const std::string& name, uint32_t base);
+  // the guest function whose translated code holds a native address (its lowest entry), or 0 when none does;
+  // each function's native code taken to run up to the next one's (diagnostics: the command tracer)
+  uint32_t guest_function(const void* native) const;
+  void* library() const { return library_; } // the loaded module (HMODULE / dlopen handle)
   // what the module wants done before the process ends (a coverage build
   // writes its counts), as the host leaves with _Exit and no atexit runs
   void finish() const { if (finish_) finish_(); }
@@ -38,6 +42,9 @@ private:
     const ::Module* module;
   };
   std::vector<Placed> placed_;
+  // native function starts with their guest address, sorted; built again when a module is placed
+  mutable std::vector<std::pair<uintptr_t, uint32_t>> natives_;
+  mutable bool natives_stale_ = true;
 };
 
 } // namespace host

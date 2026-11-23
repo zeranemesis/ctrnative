@@ -1,4 +1,5 @@
 #include "gsp.hpp"
+#include "trace.hpp"
 
 #include <chrono>
 
@@ -149,6 +150,7 @@ void Gsp::run_ring() {
       break;
     }
     case 0x01: // ProcessCommandList(address, size)
+      if (trace::on()) trace::submitted(m, d[0] & ~7u, d[1] & ~3u);
       { Timed t{kind_seconds[0]}; pn_command_list(engine_, physical(d[0] & ~7u), d[1] & ~3u); }
       interrupt(kP3d);
       break;

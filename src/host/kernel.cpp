@@ -503,6 +503,11 @@ void Kernel::thread_main(Thread* self) {
         if (w >= 0x100000 && w < 0x3E0000) fprintf(stderr, " %08x", w), n++;
       }
       fprintf(stderr, "\n");
+      // a virtual call through a null entry: r0 the object, its first word the table
+      const uint32_t table = memory_.read32(c.r[0]);
+      fprintf(stderr, "[kernel] r0 points at %08x %08x %08x %08x; table %08x: %08x %08x %08x %08x\n",
+              memory_.read32(c.r[0]), memory_.read32(c.r[0] + 4), memory_.read32(c.r[0] + 8), memory_.read32(c.r[0] + 12),
+              table, memory_.read32(table), memory_.read32(table + 4), memory_.read32(table + 8), memory_.read32(table + 12));
       char why[64];
       std::snprintf(why, sizeof why, "no recompiled code at %08x", pc);
       stop(why);

@@ -97,6 +97,32 @@ Code Module::lookup(uint32_t address) const {
   return nullptr;
 }
 
+uint32_t Module::guest_function(const void* native) const {
+  if (natives_stale_) {
+    // a function is entered at many labels, one Code for all: its lowest guest address names it
+    std::vector<std::pair<uintptr_t, uint32_t>> all;
+    auto add = [&](const Entry* entries, uint32_t count, uint32_t base) {
+      for (uint32_t i = 0; i < count; ++i)
+        if (entries[i].code) all.emplace_back(reinterpret_cast<uintptr_t>(entries[i].code), base + entries[i].address);
+    };
+    add(entries_, count_, 0);
+    for (const Placed& p : placed_) add(p.module->entries, p.module->count, p.base);
+    std::sort(all.begin(), all.end());
+    natives_.clear();
+    for (const auto& e : all)
+      if (natives_.empty() || natives_.back().first != e.first) natives_.push_back(e);
+      else natives_.back().second = std::min(natives_.back().second, e.second);
+    natives_stale_ = false;
+  }
+  const uintptr_t at = reinterpret_cast<uintptr_t>(native);
+  auto it = std::upper_bound(natives_.begin(), natives_.end(), std::pair<uintptr_t, uint32_t>{at, UINT32_MAX});
+  if (it == natives_.begin()) return 0;
+  --it;
+  // past the last function: not this module's code (a 1 MiB margin, generous for one function)
+  if (std::next(it) == natives_.end() && at - it->first > 0x100000) return 0;
+  return it->second;
+}
+
 bool Module::place(const std::string& name, uint32_t base) {
   for (uint32_t i = 0; i < module_count_; ++i) {
     const ::Module& m = modules_[i];
@@ -104,6 +130,7 @@ bool Module::place(const std::string& name, uint32_t base) {
     *m.base = base; // what the module's code reads on entry
     std::erase_if(placed_, [&](const Placed& p) { return p.module == &m; });
     if (base) placed_.push_back({base, m.size, &m});
+    natives_stale_ = true;
     return true;
   }
   return false;

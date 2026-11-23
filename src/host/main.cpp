@@ -11,6 +11,7 @@
 #include "rom.hpp"
 #include "input.hpp"
 #include "services.hpp"
+#include "trace.hpp"
 #include "y2r.hpp"
 
 #include <chrono>
@@ -92,6 +93,55 @@ LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
                static_cast<unsigned long long>(static_cast<char*>(pc) - reinterpret_cast<char*>(module)),
                e->ExceptionRecord->NumberParameters > 1 ? static_cast<unsigned long long>(e->ExceptionRecord->ExceptionInformation[1]) : 0ull);
   std::fflush(stderr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// CTRN_WATCH_WRITE=address: every write to the 4 bytes of guest memory there, by the game's code, the host or the
+// GPU engine, with the writer (module and offset), the guest function last entered and the value: the host page
+// holding them is made read-only, each write faults, runs one step and the page is protected again
+struct {
+  uintptr_t at = 0;
+  void* page = nullptr;
+  const host::Kernel* kernel = nullptr;
+  uint32_t guest = 0, before = 0;
+  bool ours = false;
+} g_watch;
+
+LONG WINAPI watch_writes(EXCEPTION_POINTERS* e) {
+  const EXCEPTION_RECORD& r = *e->ExceptionRecord;
+  if (!g_watch.page) return EXCEPTION_CONTINUE_SEARCH;
+  DWORD old;
+  if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters > 1 && r.ExceptionInformation[0] == 1 &&
+      r.ExceptionInformation[1] - reinterpret_cast<uintptr_t>(g_watch.page) < 0x1000) {
+    const uintptr_t a = r.ExceptionInformation[1];
+    g_watch.ours = a + 8 > g_watch.at && a < g_watch.at + 4;
+    if (g_watch.ours) {
+      std::memcpy(&g_watch.before, reinterpret_cast<void*>(g_watch.at), 4);
+      HMODULE module = nullptr;
+      char name[MAX_PATH] = "?";
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             static_cast<LPCSTR>(r.ExceptionAddress), &module))
+        GetModuleFileNameA(module, name, sizeof name);
+      const char* base = std::strrchr(name, '\\');
+      std::fprintf(stderr, "[watch] %08x written by %s+0x%llx, guest code last entered %08x", g_watch.guest,
+                   base ? base + 1 : name,
+                   static_cast<unsigned long long>(static_cast<char*>(r.ExceptionAddress) - reinterpret_cast<char*>(module)),
+                   g_watch.kernel ? g_watch.kernel->running_pc() : 0);
+    }
+    VirtualProtect(g_watch.page, 0x1000, PAGE_READWRITE, &old);
+    e->ContextRecord->EFlags |= 0x100; // one instruction, then protected again
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (r.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+    if (g_watch.ours) {
+      uint32_t now;
+      std::memcpy(&now, reinterpret_cast<void*>(g_watch.at), 4);
+      std::fprintf(stderr, ": %08x -> %08x\n", g_watch.before, now);
+      g_watch.ours = false;
+    }
+    VirtualProtect(g_watch.page, 0x1000, PAGE_READONLY, &old);
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
   return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
@@ -193,6 +243,7 @@ int main(int argc, char** argv) {
   }
 
   host::Kernel kernel(memory, module);
+  if (host::trace::on()) host::trace::start(module);
   host::Services services;
   services.module = &module;
   services.program_id = uint64_t{u32(exheader, 0x200)} | uint64_t{u32(exheader, 0x204)} << 32;
@@ -251,7 +302,24 @@ int main(int argc, char** argv) {
   auto rate_since = std::chrono::steady_clock::now();
   double idle_at = 0, engine_at = 0;
   const host::TestInput test_input;
+#if defined(_WIN32)
+  static const char* watch_env = std::getenv("CTRN_WATCH_WRITE");
+  if (watch_env) AddVectoredExceptionHandler(1, watch_writes), g_watch.kernel = &kernel;
+#endif
   while (!kernel.stopped()) {
+#if defined(_WIN32)
+    if (watch_env && !g_watch.page) { // armed once the game has mapped the address
+      const uint32_t guest = static_cast<uint32_t>(std::strtoul(watch_env, nullptr, 16));
+      if (uint8_t* host_byte = memory.host(guest)) {
+        g_watch.guest = guest, g_watch.at = reinterpret_cast<uintptr_t>(host_byte);
+        void* page = reinterpret_cast<void*>(g_watch.at & ~uintptr_t{0xFFF});
+        DWORD old;
+        VirtualProtect(page, 0x1000, PAGE_READONLY, &old);
+        g_watch.page = page;
+        std::fprintf(stderr, "[watch] %08x armed\n", guest);
+      }
+    }
+#endif
     pn_input input{};
     if (window && !pn_window_poll(window, &input)) {
       kernel.stop("the window was closed");
@@ -314,6 +382,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_until(next);
   }
   const std::string why = kernel.wait();
+  if (host::trace::on()) host::trace::report();
   audio.join();
   if (std::getenv("CTRN_SVC_STATS")) {
     kernel.report();

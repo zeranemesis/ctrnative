@@ -39,8 +39,11 @@ std::vector<uint8_t> read_stream(Kernel& kernel, const Y2r::Stream& s, uint32_t 
   return bytes;
 }
 
+// the DMA stops after the image size the game gave (SetReceiving): a picture taller than the buffer would spill
+// into the memory after it (Pokémon Y's title video wrote over an object there)
 void write_stream(Kernel& kernel, const Y2r::Stream& s, const std::vector<uint8_t>& bytes) {
-  const uint32_t count = static_cast<uint32_t>(bytes.size()), unit = s.unit && s.gap ? s.unit : count;
+  const uint32_t count = s.size ? std::min(static_cast<uint32_t>(bytes.size()), s.size) : static_cast<uint32_t>(bytes.size());
+  const uint32_t unit = s.unit && s.gap ? s.unit : count;
   for (uint32_t done = 0, at = s.address; done < count; at += unit + s.gap) {
     const uint32_t n = std::min(unit, count - done);
     kernel.memory().write(at, bytes.data() + done, n);
@@ -48,7 +51,9 @@ void write_stream(Kernel& kernel, const Y2r::Stream& s, const std::vector<uint8_
   }
 }
 
-void set_stream(Y2r::Stream& s, const uint32_t* c) { s = {c[1], c[2], c[3], c[4]}; }
+// (address, image size, transfer unit, gap): the unit and the gap are 16-bit, the rest of their words is not theirs
+// (Pokémon Y leaves FFFF there: read whole, its gap went backwards and wrote over the memory below its texture)
+void set_stream(Y2r::Stream& s, const uint32_t* c) { s = {c[1], c[2], c[3] & 0xFFFF, c[4] & 0xFFFF}; }
 
 } // namespace
 

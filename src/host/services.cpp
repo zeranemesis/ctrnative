@@ -401,12 +401,15 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0x10, c[3] = kernel.add_handle(session);
       return true;
     }
-    case 0x0845: { // GetFormatInfo(archive, path type, path size, <path>) for the save data
-      if (c[1] != 4) return false;
+    case 0x0845: { // GetFormatInfo(archive, path type, path size, <path>): the save data, or extra data (6, 7)
+      if (c[1] != 4 && c[1] != 6 && c[1] != 7) return false;
+      uint32_t path[3] = {};
+      kernel.memory().read(c[5], path, std::min<uint32_t>(c[3], sizeof path));
+      const std::filesystem::path root = c[1] == 4 ? save_root() : extdata_root(c[1] == 7, path[1] | uint64_t{path[2]} << 32);
       uint32_t info[4] = {};
-      std::ifstream format(save_root().string() + ".format", std::ios::binary);
+      std::ifstream format(root.string() + ".format", std::ios::binary);
       std::error_code ignored;
-      if (!format.read(reinterpret_cast<char*>(info), sizeof info) || !std::filesystem::is_directory(save_root(), ignored)) {
+      if (!format.read(reinterpret_cast<char*>(info), sizeof info) || !std::filesystem::is_directory(root, ignored)) {
         c[0] = header(command, 1, 0), c[1] = 0xC8A04554;
         return true;
       }

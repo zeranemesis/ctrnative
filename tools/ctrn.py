@@ -224,6 +224,11 @@ def main():
         sys.exit(f"{args.host}: build ctrnative first (README)")
     env = dict(os.environ)
     env.setdefault("CTRN_USER_DIR", str(args.cache / "user"))
+    # the system's shared font: a dump of the console's (<cache>/sysdata/shared_font.bin), else a stand-in made once
+    dump, stand_in = args.cache / "sysdata" / "shared_font.bin", args.cache / "shared_font_stand_in.bin"
+    if not dump.is_file() and not stand_in.is_file():
+        subprocess.run([sys.executable, str(HERE / "shared_font.py"), str(stand_in)], check=True)
+    env.setdefault("CTRN_SHARED_FONT", str(dump if dump.is_file() else stand_in))
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:
     # that address becomes a hint, the module is rebuilt (only what changed) and the game starts again
     for attempt in range(20):

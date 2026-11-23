@@ -147,6 +147,8 @@ public:
   void release(uint32_t physical, uint32_t size); // pages allocate gave, free again
   enum { kApplication, kSystem, kBase };
   uint32_t linear_base() const { return linear_base_; } // where FCRAM's start appears in the linear mapping
+  // the guest code the running thread last entered, for diagnostics (read without the lock)
+  uint32_t running_pc() const { return running_ ? running_->last_pc : 0; }
 
 private:
   friend struct Callbacks;
