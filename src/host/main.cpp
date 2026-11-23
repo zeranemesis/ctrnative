@@ -427,6 +427,7 @@ int main(int argc, char** argv) {
   const std::string why = kernel.wait();
   if (host::trace::on()) host::trace::report();
   gfx_natives.report();
+  pn_print_register_stats(engine);
   audio.join();
   if (wav.is_open()) {
     const uint32_t rate = 32728, bytes = static_cast<uint32_t>(wav_samples * 4);
