@@ -49,6 +49,7 @@ public:
     kNngxSaveStart = 24, // notices: the game's own function runs after
     kNngxSaveStop = 25,
     kNngxClear = 26,
+    kGfxRows3Data = 27,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);
@@ -87,6 +88,12 @@ private:
   // a block in memory as an operation, translated once (0: not one)
   uint32_t translated(uint32_t address, uint32_t size);
   bool list_copy(uint32_t destination, uint32_t source, uint32_t size);
+  struct Palette {
+    uint32_t start = 0, next = 0, rows = 0, first = 0;
+    bool geometry = false;
+    std::vector<uint32_t> words;
+  } palette_;
+  bool palette_rows(uint32_t where, uint32_t source, bool first, uint32_t header);
   bool uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3);
   bool nngx_add(Program& program, uint32_t function, uint32_t address, uint32_t size, bool copy);
   bool lyt_block(Program& program, uint32_t block);

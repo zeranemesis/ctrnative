@@ -29,6 +29,7 @@ const char* name(uint32_t which) {
   case GfxNatives::kGfxRows3: return "nw::gfx: a 3x4 matrix sent";
   case GfxNatives::kGfxRows4: return "nw::gfx: a 4x4 matrix sent";
   case GfxNatives::kGfxVec3: return "nw::gfx: a vector sent";
+  case GfxNatives::kGfxRows3Data: return "nw::gfx: a bone's matrix sent (palette)";
   case GfxNatives::kNngxSaveStart: return "nngx: a recording started";
   case GfxNatives::kNngxSaveStop: return "nngx: a recording stopped";
   case GfxNatives::kNngxClear: return "nngx: a list cleared";
@@ -477,6 +478,43 @@ bool GfxNatives::list_copy(uint32_t destination, uint32_t source, uint32_t size)
   return true;
 }
 
+bool GfxNatives::palette_rows(uint32_t where, uint32_t source, bool first, uint32_t header) {
+  // a bone palette (0x169a98): one index command, one 0x2C1 command over many calls, 3 rows each (0x11d7d0 for
+  // the first, with the header, 0x11d798 after). The game writes them as usual while the rows are gathered; the
+  // last call writes the whole as a mark and a padding instead (a broken sequence leaves the game's words alone)
+  Memory& m = kernel_.memory();
+  if (first) {
+    palette_ = {};
+    if (!lyt_.cursor || where - 8 != m.read32(lyt_.cursor)) return false;
+    const uint32_t index = m.read32(where - 8), reg = m.read32(where - 4) & 0xFFFF;
+    const uint32_t extra = header >> 20 & 0xFF;
+    if (!(index >> 31) || (reg != 0x2C0 && reg != 0x290) || (header & 0xFFFF) != reg + 1 || (extra + 1) % 12)
+      return false;
+    palette_ = {where - 8, where + 0x34, (extra + 1) / 4, index & 0x7F, reg == 0x290, {}};
+  } else if (!palette_.start || where != palette_.next) {
+    palette_ = {};
+    return false;
+  } else {
+    palette_.next = where + 0x30;
+  }
+  for (uint32_t i = 0; i < 3; ++i)
+    for (uint32_t k = 0; k < 4; ++k) palette_.words.push_back(m.read32(source + i * 16 + (3 - k) * 4));
+  if (palette_.words.size() / 4 < palette_.rows) return false; // the game writes this one
+  Program program;
+  program.uniforms(palette_.first, palette_.words, palette_.geometry);
+  const uint32_t footprint = (2 + 1 + palette_.rows * 4 + 1) & ~1u;
+  uint32_t at = mark_at(palette_.start, operation(program)), left = footprint - 2;
+  while (left) {
+    const uint32_t extra = std::min<uint32_t>(left - 2, 254);
+    m.write32(at, 0);
+    m.write32(at + 4, 0x2F1u | extra << 20);
+    at += (2 + extra) * 4;
+    left -= 2 + extra;
+  }
+  palette_ = {};
+  return true;
+}
+
 bool GfxNatives::uniform_rows(uint32_t where, uint32_t source, uint32_t rows, uint32_t header, bool vec3) {
   // nw::gfx's uniform writers (0x11d7d0 3 rows, 0x11d854 4 rows, 0x11d8a0 a vec3): the caller put the index command
   // at the cursor, they write the data after it. Taken when the whole is one command here: the rows from their
@@ -601,7 +639,10 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     done = list_copy(r[0], r[1], r[2]);
     break;
   case kGfxRows3:
-    done = uniform_rows(r[0], r[1], 3, r[2], false);
+    done = uniform_rows(r[0], r[1], 3, r[2], false) || palette_rows(r[0], r[1], true, r[2]);
+    break;
+  case kGfxRows3Data:
+    done = palette_rows(r[0], r[1], false, 0);
     break;
   case kGfxRows4:
     done = uniform_rows(r[0], r[1], 4, r[2], false);
