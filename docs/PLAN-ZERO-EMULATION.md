@@ -2,6 +2,28 @@
 
 Ce plan détaille ce qu'il reste à faire après le travail du 2026-11-23 sur NSMB2. Il complète `PLAN.md` (phases A à H), `RENDU-NATIF.md` (le principe) et `BIBLIOTHEQUES-GRAPHIQUES.md` (qui utilise quoi).
 
+## Principes (demandés par l'utilisateur, 2026-11-23)
+
+Dans cet ordre de priorité :
+1. **Les jeux fonctionnent.**
+   - Chaque jeu se joue du début à la fin sans plantage ni erreur de rendu.
+   - Preuve : un parcours d'essai rejouable par jeu (`tests/<jeu>/`), en pas fixe, et la comparaison octet par octet avec et sans natives (`tools/ab_natives.py`).
+2. **Aucune émulation.**
+   - Le code est traduit à l'avance, la mémoire et les services sont natifs, et le rendu passe par des opérations natives, pas par la relecture de commandes PICA200.
+   - Ce qui reste encore émulé est mesuré et dit (`PN_REG_STATS`), jamais caché.
+3. **Le jeu d'origine par défaut.**
+   - Sans option, le jeu se comporte et s'affiche comme sur la console : même rythme (59,83 Hz), même résolution, même logique.
+4. **Les améliorations sont des options, désactivées par défaut :**
+   - résolution ;
+   - filtrage ;
+   - images intermédiaires au-delà de 60 ;
+   - écran large ;
+   - mods.
+
+   Une option ne doit jamais casser le jeu : chacune se vérifie comme le reste.
+
+L'objectif de performance est le jeu en cours de partie : 60 images/s stables, sans saccade, sur tous les jeux. Le temps de chargement n'est pas une priorité.
+
 ## 0. Où on en est
 
 **Ce qui est déjà natif, sans émulation :**
