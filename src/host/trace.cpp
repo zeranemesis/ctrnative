@@ -24,10 +24,11 @@ namespace {
 constexpr uint32_t kHost = 0xFFFFFFFF;    // written by the host or the GPU engine, not by the game's code
 constexpr uint32_t kUnknown = 0xFFFFFFFE; // written before its page was watched (a buffer's first use)
 
-// the game function that wrote a word, and the two that called it (0: none)
+// the game function that wrote a word, and the ones that called it, nearest first (0: none)
+constexpr int kDepth = 6;
 struct Writer {
-  uint32_t fn[3] = {kUnknown, 0, 0};
-  bool operator<(const Writer& o) const { return std::lexicographical_compare(fn, fn + 3, o.fn, o.fn + 3); }
+  uint32_t fn[kDepth] = {kUnknown};
+  bool operator<(const Writer& o) const { return std::lexicographical_compare(fn, fn + kDepth, o.fn, o.fn + kDepth); }
 };
 
 const Module* g_module = nullptr;
@@ -56,7 +57,7 @@ Writer who(const CONTEXT* faulting) {
   CONTEXT c = *faulting;
   if (!in_module(c.Rip)) return w.fn[0] = kHost, w;
   int found = 0;
-  for (int frame = 0; frame < 16 && found < 3 && c.Rip; ++frame) {
+  for (int frame = 0; frame < 32 && found < kDepth && c.Rip; ++frame) {
     if (in_module(c.Rip)) {
       const uint32_t fn = g_module->guest_function(reinterpret_cast<const void*>(c.Rip));
       if (fn && (found == 0 || w.fn[found - 1] != fn)) w.fn[found++] = fn;
@@ -68,7 +69,7 @@ Writer who(const CONTEXT* faulting) {
     DWORD64 establisher = 0;
     RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, entry, &c, &handler_data, &establisher, nullptr);
   }
-  for (int i = found; i < 3; ++i) w.fn[i] = 0;
+  for (int i = found; i < kDepth; ++i) w.fn[i] = 0;
   return w;
 }
 
@@ -165,8 +166,12 @@ void report() {
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   if (const char* path = std::getenv("CTRN_TRACE_CMDS")) {
     std::ofstream out(path);
-    out << "words,writer,caller,caller2\n";
-    for (const auto& [n, w] : rows) out << n << ',' << name(w.fn[0]) << ',' << name(w.fn[1]) << ',' << name(w.fn[2]) << '\n';
+    out << "words,writer,caller,caller2,caller3,caller4,caller5\n";
+    for (const auto& [n, w] : rows) {
+      out << n;
+      for (uint32_t fn : w.fn) out << ',' << name(fn);
+      out << '\n';
+    }
   }
   std::vector<std::pair<uint64_t, uint32_t>> top;
   for (const auto& [fn, n] : by_function) top.emplace_back(n, fn);

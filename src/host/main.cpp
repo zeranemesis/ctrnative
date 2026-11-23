@@ -280,6 +280,15 @@ int main(int argc, char** argv) {
 
   // the DSP's clock: a frame of 160 samples at 32728 Hz, every 4.889 ms of real
   // time; frames late are run one by one, so their count follows the clock
+  // CTRN_AUDIO_WAV=file: what the DSP puts out, stereo 16-bit at its 32728 Hz, and at the end how loud it was and
+  // its longest silence (a test that the sound is there, without a player)
+  std::ofstream wav;
+  uint64_t wav_samples = 0, wav_silent = 0, wav_longest_silence = 0;
+  int wav_peak = 0;
+  if (const char* path = std::getenv("CTRN_AUDIO_WAV")) {
+    wav.open(path, std::ios::binary);
+    wav.write(std::string(44, '\0').data(), 44); // the header once the size is known
+  }
   std::thread audio([&] {
     const auto audio_period = std::chrono::nanoseconds(160ull * 1000000000ull / 32728);
     auto due = std::chrono::steady_clock::now() + audio_period;
@@ -295,6 +304,16 @@ int main(int argc, char** argv) {
         }
         if (window && !samples.empty())
           pn_window_audio(window, samples.data(), static_cast<uint32_t>(samples.size() / 2));
+        if (wav.is_open() && !samples.empty()) {
+          wav.write(reinterpret_cast<const char*>(samples.data()), static_cast<std::streamsize>(samples.size() * 2));
+          for (size_t i = 0; i + 1 < samples.size(); i += 2) {
+            const int level = std::max(std::abs(int{samples[i]}), std::abs(int{samples[i + 1]}));
+            wav_peak = std::max(wav_peak, level);
+            wav_silent = level < 64 ? wav_silent + 1 : 0; // under -54 dBFS: silence
+            wav_longest_silence = std::max(wav_longest_silence, wav_silent);
+          }
+          wav_samples += samples.size() / 2;
+        }
         due += audio_period;
       }
       if (std::chrono::steady_clock::now() > due + audio_period * 8) due = std::chrono::steady_clock::now(); // far behind
@@ -405,6 +424,17 @@ int main(int argc, char** argv) {
   const std::string why = kernel.wait();
   if (host::trace::on()) host::trace::report();
   audio.join();
+  if (wav.is_open()) {
+    const uint32_t rate = 32728, bytes = static_cast<uint32_t>(wav_samples * 4);
+    auto u32 = [&](uint32_t v) { wav.write(reinterpret_cast<const char*>(&v), 4); };
+    auto u16 = [&](uint16_t v) { wav.write(reinterpret_cast<const char*>(&v), 2); };
+    wav.seekp(0);
+    wav.write("RIFF", 4), u32(36 + bytes), wav.write("WAVEfmt ", 8), u32(16), u16(1), u16(2), u32(rate), u32(rate * 4),
+        u16(4), u16(16), wav.write("data", 4), u32(bytes);
+    wav.close();
+    std::printf("[host] audio: %.1f s recorded, peak %d (%.1f dBFS), longest silence %.2f s\n", wav_samples / double(rate),
+                wav_peak, wav_peak ? 20 * std::log10(wav_peak / 32768.0) : -999.0, wav_longest_silence / double(rate));
+  }
   if (std::getenv("CTRN_SVC_STATS")) {
     kernel.report();
     const double* k = gsp.kind_seconds;
