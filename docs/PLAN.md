@@ -7,11 +7,13 @@ Les étapes le rendent valable pour tous les jeux.
 1. **Le moteur seul** — fait. Noyau, mémoire, services, GPU (gsp), son (dsp),
    fenêtre picanative ; titre et identifiant du jeu lus dans son exheader ;
    variables `CTRN_*`.
-2. **Les services par requêtes IPC.** Le port de SM3DL passe encore par
-   77 remplacements de fonctions du SDK à des adresses fixes (fichiers, manette,
-   écran tactile, GPU, son). Chacun devient la réponse du service au niveau IPC
-   (`fs:USER`, `hid:USER`, `gsp::Gpu`, `dsp::DSP`, `apt:U`…), commune à tous
-   les jeux. Contrôle : SM3DL tourne avec un module généré sans ses overrides.
+2. **Les services par requêtes IPC** — fait. Le port de SM3DL passait par
+   77 remplacements de fonctions du SDK à des adresses fixes. Le moteur répond
+   maintenant au niveau IPC, comme pour tous les jeux : la RomFS ouverte
+   directement (archive 3), la sauvegarde (archive 4 : formatage, infos,
+   ouverture, dossiers lus pour de vrai), la manette et l'écran tactile écrits
+   à chaque image dans la mémoire partagée de HID. Contrôle : SM3DL, module
+   généré sans aucun remplacement, va de l'introduction à la carte du monde 1.
 3. **Le lanceur.** Une ROM décryptée en entrée : extraction de l'ExeFS, de
    l'exheader et de la RomFS, 3dsrecomp, compilation du module, cache par
    identifiant du jeu et empreinte du code, lancement.

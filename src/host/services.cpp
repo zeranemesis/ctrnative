@@ -1,6 +1,7 @@
 #include "services.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -146,12 +147,15 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
   if (service == "cfg:u" || service == "cfg:s" || service == "cfg:i") return cfg(kernel, c);
   if (service == "cecd:u") return cecd(kernel, c);
   if (service == "hid:USER" || service == "hid:SPVR") return hid(kernel, c);
+  if (service == "FSDir") {
+    auto session = kernel.resolve(thread.ctx.r[0]);
+    return session && fs_directory(kernel, static_cast<Session&>(*session).sub, c);
+  }
   if (service == "FSFile") {
     auto session = kernel.resolve(thread.ctx.r[0]);
     return session && fs_file(kernel, static_cast<Session&>(*session).sub, c);
   }
-  // fs: the game's files and saves go through the platform layer (Port/platform/fs.c);
-  // what reaches the service is the session's own business
+  // fs: the game's RomFS and ExeFS (in the ROM), its save data and shared extra data (on the host)
   if (service == "fs:USER") {
     switch (command) {
     case 0x0801: case 0x0861: case 0x0840: case 0x085A: case 0x085D: case 0x086E:
@@ -162,12 +166,24 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
     case 0x0814: case 0x0815: case 0x0849: reply(c, command, {0x200, 0x4000, 0x80000, 0x80000}); return true;
     case 0x0817: case 0x0818: case 0x0821: case 0x083D: reply(c, command, {1}); return true;
     case 0x0862: fs_priority_ = c[1], reply(c, command); return true;
-    case 0x080C: { // OpenArchive(archive, path type, path size, <path>) for what fs.c leaves here
+    case 0x080C: { // OpenArchive(archive, path type, path size, <path>)
       uint32_t path[3] = {};
       kernel.memory().read(c[5], path, std::min<uint32_t>(c[3], sizeof path));
       if (c[1] == 3) { // SelfNCCH: the game's own RomFS, opened as a file below
         const uint64_t handle = next_archive_++;
         archives_[handle] = kSelfNcch;
+        c[0] = header(command, 3, 0), c[1] = kOk, c[2] = uint32_t(handle), c[3] = uint32_t(handle >> 32);
+        return true;
+      }
+      if (c[1] == 4) { // the game's save data: a directory of the host, once formatted
+        const std::filesystem::path root = save_root();
+        std::error_code ignored;
+        if (!std::filesystem::is_directory(root, ignored)) {
+          c[0] = header(command, 1, 0), c[1] = 0xC8A04554; // not formatted: the game formats it
+          return true;
+        }
+        const uint64_t handle = next_archive_++;
+        archives_[handle] = root;
         c[0] = header(command, 3, 0), c[1] = kOk, c[2] = uint32_t(handle), c[3] = uint32_t(handle >> 32);
         return true;
       }
@@ -198,6 +214,19 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       uint32_t archive_path[4] = {}, file_path[5] = {};
       kernel.memory().read(c[10], archive_path, std::min<uint32_t>(c[4], sizeof archive_path));
       kernel.memory().read(c[12], file_path, std::min<uint32_t>(c[6], sizeof file_path));
+      if (c[2] == 3) { // SelfNCCH, the game itself: its 12-byte binary file path as OpenFile's below
+        if (c[5] != 2 || c[6] != 12) return false;
+        char exefs_name[9] = {};
+        std::memcpy(exefs_name, file_path + 1, 8);
+        HostFile rom;
+        if (!section_in_rom(file_path[0], exefs_name, rom)) return false;
+        const uint32_t id = next_file_++;
+        files_[id] = rom;
+        auto session = std::make_shared<Session>(Object::Kind::Session, "FSFile");
+        session->sub = id;
+        c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0x10, c[3] = kernel.add_handle(session);
+        return true;
+      }
       // the console's system titles (NCCH archive, NAND, a RomFS): the stand-ins Zakuro
       // gives: the Mii data an empty CFL_Res.dat (titles start, with no Mii to draw);
       // shortcut: the region manifest and the bad word list come as empty files, build them if a game reads them
@@ -281,6 +310,48 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       return true;
     }
     case 0x080E: archives_.erase(c[1] | uint64_t{c[2]} << 32), reply(c, command); return true; // CloseArchive
+    case 0x080B: { // OpenDirectory(archive, path type, path size, <path>)
+      const auto found = archives_.find(c[1] | uint64_t{c[2]} << 32);
+      if (found == archives_.end() || found->second == kSelfNcch) return false;
+      const std::filesystem::path path = found->second / read_path(kernel, c[3], c[4], c[6]);
+      std::error_code ignored;
+      if (!std::filesystem::is_directory(path, ignored)) {
+        c[0] = header(command, 1, 0), c[1] = 0xC8804471; // path not found
+        return true;
+      }
+      HostDirectory directory;
+      for (const auto& entry : std::filesystem::directory_iterator(path, ignored)) directory.entries.push_back(entry);
+      const uint32_t id = next_file_++;
+      directories_[id] = std::move(directory);
+      auto session = std::make_shared<Session>(Object::Kind::Session, "FSDir");
+      session->sub = id;
+      c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0x10, c[3] = kernel.add_handle(session);
+      return true;
+    }
+    case 0x0845: { // GetFormatInfo(archive, path type, path size, <path>) for the save data
+      if (c[1] != 4) return false;
+      uint32_t info[4] = {};
+      std::ifstream format(save_root().string() + ".format", std::ios::binary);
+      std::error_code ignored;
+      if (!format.read(reinterpret_cast<char*>(info), sizeof info) || !std::filesystem::is_directory(save_root(), ignored)) {
+        c[0] = header(command, 1, 0), c[1] = 0xC8A04554;
+        return true;
+      }
+      reply(c, command, {info[0], info[1], info[2], info[3] & 0xFF}); // size, directories, files, duplicate
+      return true;
+    }
+    case 0x084C: { // FormatSaveData(archive, path type, path size, blocks, directories, files, buckets x2, duplicate, <path>)
+      if (c[1] != 4) return false;
+      const std::filesystem::path root = save_root();
+      std::error_code ignored;
+      std::filesystem::remove_all(root, ignored);
+      std::filesystem::create_directories(root, ignored);
+      // as Zakuro keeps it: size in bytes, directories, files, duplicate
+      const uint32_t info[4] = {c[4] * 512, c[5], c[6], c[9] & 0xFF};
+      std::ofstream(root.string() + ".format", std::ios::binary).write(reinterpret_cast<const char*>(info), sizeof info);
+      reply(c, command);
+      return true;
+    }
     case 0x0863: reply(c, command, {fs_priority_}); return true;
     default: return false;
     }
@@ -459,7 +530,7 @@ bool Services::hid(Kernel& kernel, uint32_t* c) {
     if (!hid_block_) {
       auto block = std::make_shared<SharedMemory>();
       block->size = 0x1000;
-      block->physical = kernel.allocate(Kernel::kBase, 0x1000, false);
+      block->physical = hid_physical_ = kernel.allocate(Kernel::kBase, 0x1000, false);
       std::memset(kernel.memory().physical(block->physical, 0x1000), 0, 0x1000);
       hid_block_ = kernel.add_handle(block);
       for (int i = 0; i < 5; ++i) {
@@ -484,6 +555,42 @@ bool Services::hid(Kernel& kernel, uint32_t* c) {
   }
   case 0x0016: reply(c, command, {0, 0, 0, 0, 0}); return true; // GetGyroscopeLowCalibrateParam
   case 0x0017: reply(c, command, {0x3F}); return true;          // GetSoundVolume
+  default: return false;
+  }
+}
+
+// a directory the service opened: Read gives entries as the console lays them out (0x228 bytes:
+// the UTF-16 name, the 8.3 short name and extension, the attributes, the size)
+bool Services::fs_directory(Kernel& kernel, uint32_t id, uint32_t* c) {
+  const uint32_t command = c[0] >> 16;
+  const auto found = directories_.find(id);
+  if (found == directories_.end()) return false;
+  HostDirectory& directory = found->second;
+  switch (command) {
+  case 0x0801: { // Read(count, <buffer>) -> how many
+    const uint32_t count = c[1], to = c[3];
+    uint32_t done = 0;
+    for (; done < count && directory.next < directory.entries.size(); ++done, ++directory.next) {
+      const auto& entry = directory.entries[directory.next];
+      uint8_t e[0x228] = {};
+      const std::u16string name = entry.path().filename().u16string();
+      for (size_t i = 0; i < name.size() && i < 0x105; ++i) std::memcpy(e + 2 * i, &name[i], 2);
+      const std::string narrow = entry.path().stem().string(), extension = entry.path().extension().string();
+      for (size_t i = 0; i < 8 && i < narrow.size(); ++i) e[0x20C + i] = static_cast<uint8_t>(std::toupper(narrow[i]));
+      for (size_t i = 1; i < 4 && i < extension.size(); ++i) e[0x215 + i - 1] = static_cast<uint8_t>(std::toupper(extension[i]));
+      e[0x219] = 1;
+      std::error_code ignored;
+      const bool folder = entry.is_directory(ignored);
+      e[0x21B] = folder;
+      e[0x21D] = !folder; // the archive attribute, as the console sets it on files
+      const uint64_t size = folder ? 0 : entry.file_size(ignored);
+      std::memcpy(e + 0x220, &size, 8);
+      kernel.memory().write(to + done * 0x228, e, sizeof e);
+    }
+    c[0] = header(command, 2, 2), c[1] = kOk, c[2] = done, c[3] = (count * 0x228) << 4 | 0xC, c[4] = to;
+    return true;
+  }
+  case 0x0802: directories_.erase(found), reply(c, command); return true; // Close
   default: return false;
   }
 }
@@ -558,7 +665,7 @@ bool Services::fs_file(Kernel& kernel, uint32_t id, uint32_t* c) {
 }
 
 // where a part of the game lies in the ROM (CTRN_ROM, a decrypted .3ds): its RomFS
-// level 3 (kind 0, as fs.c finds it) or an ExeFS file by name (kind 2)
+// level 3 (kind 0) or an ExeFS file by name (kind 2)
 bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
   const char* rom = std::getenv("CTRN_ROM");
   if (!rom) return false;
@@ -594,8 +701,51 @@ bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
   return true;
 }
 
-void Services::vblank(Kernel& kernel) {
+// HID's shared memory, as the console's HID module fills it (3dbrew, "HID Shared Memory"):
+// the pad at 0x00 and the touch screen at 0xA8, each a ring of 8 entries the game reads
+// from the latest index; the tick at the head changes each time the index comes back to 0
+std::filesystem::path Services::save_root() const {
+  const char* user = std::getenv("CTRN_USER_DIR");
+  char name[17];
+  std::snprintf(name, sizeof name, "%016llX", static_cast<unsigned long long>(program_id));
+  return std::filesystem::path(user ? user : "user") / "savedata" / name;
+}
+
+void Services::vblank(Kernel& kernel, const Input& input) {
   if (!hid_events_[0]) return;
+  if (uint8_t* m = kernel.memory().physical(hid_physical_, 0x1000)) {
+    auto put32 = [&](uint32_t at, uint32_t v) { std::memcpy(m + at, &v, 4); };
+    auto put16 = [&](uint32_t at, int32_t v) { const uint16_t w = static_cast<uint16_t>(v); std::memcpy(m + at, &w, 2); };
+    auto put64 = [&](uint32_t at, uint64_t v) { std::memcpy(m + at, &v, 8); };
+    hid_index_ = (hid_index_ + 1) % 8;
+    if (hid_index_ == 0) {
+      const uint64_t now = kernel.ticks();
+      put64(0x08, hid_reset_tick_), put64(0xB0, hid_reset_tick_); // the previous reset
+      put64(0x00, now), put64(0xA8, now);
+      hid_reset_tick_ = now;
+    }
+    // the circle pad: about 155 at full tilt, and the four directions as buttons
+    const auto axis = [](float v) { return static_cast<int32_t>((v > 1 ? 1 : v < -1 ? -1 : v) * 155.0f); };
+    const int32_t x = axis(input.circle_x), y = axis(input.circle_y);
+    uint32_t buttons = input.buttons;
+    if (x > 77) buttons |= 1u << 28;
+    if (x < -77) buttons |= 1u << 29;
+    if (y > 77) buttons |= 1u << 30;
+    if (y < -77) buttons |= 1u << 31;
+    put32(0x10, hid_index_);
+    put32(0x1C, buttons); // the raw state
+    put16(0x20, x), put16(0x22, y);
+    const uint32_t pad = 0x28 + hid_index_ * 0x10;
+    put32(pad, buttons), put32(pad + 4, buttons & ~hid_previous_), put32(pad + 8, ~buttons & hid_previous_);
+    put16(pad + 12, x), put16(pad + 14, y);
+    hid_previous_ = buttons;
+    const uint32_t touch = 0xC8 + hid_index_ * 8;
+    put32(0xB8, hid_index_);
+    for (uint32_t at : {0xC0u, touch}) {
+      put16(at, input.touching ? input.touch_x : 0), put16(at + 2, input.touching ? input.touch_y : 0);
+      put32(at + 4, input.touching ? 1 : 0);
+    }
+  }
   kernel.signal(*hid_events_[0]); // the pad
   kernel.signal(*hid_events_[1]); // the touch screen
   if (accelerometer_users_) kernel.signal(*hid_events_[2]);

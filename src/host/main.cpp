@@ -8,6 +8,7 @@
 #include "memory.hpp"
 #include "module.hpp"
 #include "native.hpp"
+#include "input.hpp"
 #include "services.hpp"
 
 #include <chrono>
@@ -40,11 +41,11 @@ uint32_t u32(const std::vector<uint8_t>& b, size_t at) {
   return v;
 }
 
-// the top screen as a PPM (CTRN_SHOT_EVERY): the framebuffer is stored a column at a
+// a screen w pixels wide (400 the top, 320 the bottom) as a PPM (CTRN_SHOT_EVERY): the framebuffer is stored a column at a
 // time from the bottom, in the console's byte order (ABGR, BGR, then 16-bit formats)
-void save_screen(pn_engine* engine, host::Memory& memory, const pn_screen& s, const std::string& path) {
+void save_screen(pn_engine* engine, host::Memory& memory, const pn_screen& s, const std::string& path, uint32_t w) {
   static const uint32_t bpp[] = {4, 3, 2, 2, 2, 2, 2, 2};
-  const uint32_t f = s.format & 7, px = bpp[f], stride = s.stride ? s.stride : 240 * px, w = 400, h = 240;
+  const uint32_t f = s.format & 7, px = bpp[f], stride = s.stride ? s.stride : 240 * px, h = 240;
   if (!s.address) return;
   // the first call starts the GPU's copy back, the second waits for it to land in memory
   pn_sync_for_cpu(engine, s.address, stride * w);
@@ -133,8 +134,9 @@ int main(int argc, char** argv) {
   char message[512] = {};
   pn_engine* engine = pn_create_ex(
       [](void* user, uint32_t address, uint32_t size) { return static_cast<host::Memory*>(user)->physical(address, size); },
-      // captures (CTRN_SHOT_EVERY) read the screens from memory: no surfaces kept on the GPU then
-      &memory, (std::getenv("CTRN_SHOT_EVERY") ? 0 : PN_CACHE_SURFACES) | PN_ASYNC_PIPELINES, message, sizeof message);
+      // CTRN_UNCACHED=1: no surfaces kept on the GPU, every one read back (4 times slower; captures
+      // work either way, each copies its screen back from the GPU first)
+      &memory, (std::getenv("CTRN_UNCACHED") ? 0 : PN_CACHE_SURFACES) | PN_ASYNC_PIPELINES, message, sizeof message);
   if (!engine) {
     std::fprintf(stderr, "picanative: %s\n", message);
     return 2;
@@ -210,16 +212,20 @@ int main(int argc, char** argv) {
   const uint64_t shot_every = shot_env ? std::strtoull(shot_env, nullptr, 10) : 0;
   const std::string shot_dir = std::getenv("CTRN_SHOT_DIR") ? std::getenv("CTRN_SHOT_DIR") : ".";
   auto rate_since = std::chrono::steady_clock::now();
+  const host::TestInput test_input;
   while (!kernel.stopped()) {
     pn_input input{};
     if (window && !pn_window_poll(window, &input)) {
       kernel.stop("the window was closed");
       break;
     }
+    host::Services::Input frame_input{input.buttons, input.circle_x, input.circle_y, input.touch_x, input.touch_y,
+                                      input.touching != 0};
+    test_input.apply(frames, frame_input);
     {
       auto lock = kernel.lock();
       gsp.vblank();
-      services.vblank(kernel);
+      services.vblank(kernel, frame_input);
       const auto screens = gsp.screens();
       if (window) pn_window_present(window, screens.data());
       // the game's frame rate: a new top-screen picture is a frame it finished
@@ -228,7 +234,9 @@ int main(int argc, char** argv) {
       if (shot_every && frames % shot_every == 0) {
         char name[32];
         std::snprintf(name, sizeof name, "/f%06llu.ppm", static_cast<unsigned long long>(frames));
-        save_screen(engine, memory, screens[0], shot_dir + name);
+        save_screen(engine, memory, screens[0], shot_dir + name, 400);
+        std::snprintf(name, sizeof name, "/b%06llu.ppm", static_cast<unsigned long long>(frames));
+        save_screen(engine, memory, screens[1], shot_dir + name, 320); // the bottom screen
       }
     }
     if (const auto now = std::chrono::steady_clock::now(); now - rate_since >= std::chrono::seconds(10)) {

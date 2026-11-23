@@ -1,4 +1,4 @@
-// The host's native API for the game's platform layer (Port/platform/native.c):
+// The host's native API for a game's own platform layer (a port that replaces SDK functions):
 // what the SDK's service wrappers did through IPC, called directly. The game
 // finds these exports at run time; no command buffer, handle or svc.
 #include "native.hpp"
@@ -168,8 +168,7 @@ NATIVE_API(host_ndm_suspend_scheduler) { return call(ctx, "ndm:u", {0x00080040u,
 NATIVE_API(host_ndm_resume_scheduler) { return call(ctx, "ndm:u", {0x00090000u}, CALL_OUT); }
 NATIVE_API(host_ndm_default) { return call(ctx, "ndm:u", {0x00140040u, in[0]}, CALL_OUT); }
 
-// fs: what Port/platform/fs.c leaves to the service (shared extra data, the system
-// titles, the SelfNCCH archive), on the wrappers' own arguments:
+// fs, on the wrappers' own arguments:
 //   Initialize(session)
 //   OpenFile(session, &file, transaction, -, archive (2), path type, path, path size, flags, attributes)
 //   OpenFileDirectly(session, &file, transaction, archive, archive path type, archive path,
