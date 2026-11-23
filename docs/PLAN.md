@@ -127,9 +127,12 @@ Décision du 2026-11-23 : rien ne doit être émulé. Le code du jeu l'est déj�
 (traduit à l'avance, exécuté en natif) ; le système (fichiers, son, threads)
 est une couche de compatibilité, comme Wine. Restent à supprimer :
 
-1. **La mémoire de la 3DS** derrière une table de pages consultée à chaque
-   accès : la mémoire du jeu placée telle quelle dans 4 Gio réservés du PC,
-   un accès = une addition à une base.
+1. ~~**La mémoire de la 3DS** derrière une table de pages consultée à chaque
+   accès~~ : fait (fastmem, ABI 6 de 3dsrecomp). La mémoire physique est une
+   section partagée, chaque mapping du jeu une vue de celle-ci dans 4 Gio
+   réservés, en lecture seule là où le jeu ne peut pas écrire ; un accès =
+   `base + adresse`. Un accès hors de ce qui est mappé arrête la partie en
+   nommant l'adresse (« the game wrote to … ») au lieu d'être ignoré.
 2. **Les shaders du GPU** traduits pendant la partie : traduits à l'avance,
    avec le reste du jeu.
 3. **Les listes de commandes PICA200** que le jeu fabrique et que picanative
