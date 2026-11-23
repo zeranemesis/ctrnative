@@ -72,6 +72,9 @@ private:
   std::map<std::vector<uint32_t>, uint32_t> known_;
   std::map<uint32_t, uint64_t> calls_, done_;
   uint64_t unknown_marks_ = 0;
+  // blocks not copied, translated once: (address, size) → (content hash, operation)
+  std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint32_t>> translated_;
+  uint64_t uncopied_words_ = 0, translated_words_ = 0;
 };
 
 } // namespace host
