@@ -50,6 +50,7 @@ public:
     kNngxSaveStop = 25,
     kNngxClear = 26,
     kGfxRows3Data = 27,
+    kGfxVec4 = 28,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);

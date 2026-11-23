@@ -402,6 +402,8 @@ GFX_NATIVES = [
       0xE5940018, 0xE3500000, 0x0A000014, 0xE5941020]),
     (27, "nw::gfx: a 3x4 matrix written in a palette (no header)",
      [0xECB10A0C, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xEDC01A00, 0xED802A07, 0xEDC02A06, 0xED803A05, 0xEDC03A04, 0xED804A0B, 0xEDC04A0A, 0xED805A09, 0xEDC05A08, 0xE12FFF1E]),
+    (28, "nw::gfx: a vec4 written after its index command",
+     [0xECB10A04, 0xED800A03, 0xEDC00A02, 0xED801A01, 0xEDC01A00, 0xE12FFF1E]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}

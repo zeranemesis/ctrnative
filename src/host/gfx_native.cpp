@@ -29,6 +29,7 @@ const char* name(uint32_t which) {
   case GfxNatives::kGfxRows3: return "nw::gfx: a 3x4 matrix sent";
   case GfxNatives::kGfxRows4: return "nw::gfx: a 4x4 matrix sent";
   case GfxNatives::kGfxVec3: return "nw::gfx: a vector sent";
+  case GfxNatives::kGfxVec4: return "nw::gfx: a vec4 sent";
   case GfxNatives::kGfxRows3Data: return "nw::gfx: a bone's matrix sent (palette)";
   case GfxNatives::kNngxSaveStart: return "nngx: a recording started";
   case GfxNatives::kNngxSaveStop: return "nngx: a recording stopped";
@@ -526,9 +527,9 @@ bool GfxNatives::uniform_rows(uint32_t where, uint32_t source, uint32_t rows, ui
   if (!(index >> 31) || (reg != 0x2C0 && reg != 0x290)) return false;
   uint32_t footprint; // words, from the index command
   std::vector<uint32_t> w(rows * 4);
-  if (vec3) {
+  if (vec3 || rows == 0) { // a vec3 (w = 0) or a vec4 (rows 0: 0x11d710)
     if (index_header != (0x804F0000u | reg)) return false; // the index, then the 4 data words in one command
-    w = {0, m.read32(source + 8), m.read32(source + 4), m.read32(source)};
+    w = {vec3 ? 0 : m.read32(source + 12), m.read32(source + 8), m.read32(source + 4), m.read32(source)};
     footprint = 6;
   } else {
     if ((header & 0xFFFF) != reg + 1 || (header >> 20 & 0xFF) != rows * 4 - 1) return false;
@@ -649,6 +650,9 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
     break;
   case kGfxVec3:
     done = uniform_rows(r[0], r[1], 1, 0, true);
+    break;
+  case kGfxVec4:
+    done = uniform_rows(r[0], r[1], 0, 0, false);
     break;
   case kGfxCamera: { // 0x170c74(ctx, camera, force): view (camera+0x148, 3 rows) in c90, projection (+0x1a8) in c86
     Memory& m = kernel_.memory();
