@@ -38,6 +38,8 @@ public:
     kCopyUnaligned = 16, // copies: asked only for a block copied where the next command goes
     kCopyAligned = 17,
     kCopy = 18,
+    kGfxCamera = 19,
+    kGfxUniformBlock = 20,
   };
 
   GfxNatives(Kernel& kernel, pn_engine* engine);

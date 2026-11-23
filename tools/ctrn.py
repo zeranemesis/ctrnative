@@ -377,6 +377,11 @@ GFX_NATIVES = [
     (18, "__aeabi_memcpy: a block copied into the command list",
      [0xE3520003, 0x9A000017, 0xE210C003, 0x0A000008, 0xE4D13001, 0xE35C0002, 0xE082200C, 0x94D1C001,
       0xE4C03001, 0x34D13001, 0x94C0C001, 0xE2422004]),
+    (19, "nw::gfx: a camera's matrices sent",
+     [0xE92D41F0, 0xE1A04001, 0xE5901028, 0xE1510004, 0x03520000, 0x0A00002A, 0xE59F50B0, 0xE5804028,
+      0xE59F60A4, 0xE59F809C, 0xE5950000, 0xE59F20A0, 0xE2841F52, 0xE5806004, 0xE5808000, 0xE2800008]),
+    (20, "nw::gfx: a shader's booleans and integers sent (6 words copied)",
+     [0xE92D0E30, 0xE8B1003C, 0xE8B11800, 0xE8A0003C, 0xE8A01800, 0xE8BD0E30, 0xE12FFF1E]),
 ]
 # natives the host sees after the game's own function ran, with its arguments (what it made, translated once)
 AFTER_NATIVES = {8}

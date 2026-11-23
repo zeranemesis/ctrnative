@@ -1,6 +1,8 @@
 #include "gfx_native.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace host {
@@ -23,6 +25,8 @@ const char* name(uint32_t which) {
   case GfxNatives::kNngxAdd3DCommand: return "nngx: a block of commands added (copied)";
   case GfxNatives::kNngxAddBlock: return "nngx: a block {address, size, copied} added";
   case GfxNatives::kViewport: return "NSMB2: a viewport set";
+  case GfxNatives::kGfxCamera: return "nw::gfx: a camera's matrices sent";
+  case GfxNatives::kGfxUniformBlock: return "nw::gfx: a shader's booleans and integers sent";
   case GfxNatives::kCopyUnaligned: return "__aeabi_memcpy (unaligned): a block copied into the list";
   case GfxNatives::kCopyAligned: return "__aeabi_memcpy4: a block copied into the list";
   case GfxNatives::kCopy: return "__aeabi_memcpy: a block copied into the list";
@@ -71,16 +75,16 @@ uint32_t float31(float f) {
 
 // An operation's program: register writes and vertex uniform loads, in order.
 //   reg | mask << 16, value              a register (reg < 0x300)
-//   0x80000000 | first << 8 | count, 4 × count words   vertex float uniforms, w first
+//   0x80000000 | geometry << 15 | first << 8 | count, 4 × count words   float uniforms, w first
 struct GfxNatives::Program {
   std::vector<uint32_t> words;
   void write(uint32_t reg, uint32_t value, uint32_t mask = 0xF) {
     words.push_back(reg | mask << 16);
     words.push_back(value);
   }
-  void uniforms(uint32_t first, const std::vector<uint32_t>& data) {
+  void uniforms(uint32_t first, const std::vector<uint32_t>& data, bool geometry = false) {
     if (data.empty()) return;
-    words.push_back(0x80000000u | first << 8 | static_cast<uint32_t>(data.size() / 4));
+    words.push_back(0x80000000u | (geometry ? 1u : 0u) << 15 | first << 8 | static_cast<uint32_t>(data.size() / 4));
     words.insert(words.end(), data.begin(), data.end());
   }
 };
@@ -99,7 +103,8 @@ void GfxNatives::run(void* self, uint32_t operation) {
   for (size_t i = 0; i + 1 < w.size();) {
     if (w[i] >> 31) {
       const uint32_t first = w[i] >> 8 & 0x7F, count = w[i] & 0xFF;
-      pn_vertex_uniforms(natives.engine_, first, &w[i + 1], count);
+      if (w[i] >> 15 & 1) pn_geometry_uniforms(natives.engine_, first, &w[i + 1], count);
+      else pn_vertex_uniforms(natives.engine_, first, &w[i + 1], count);
       i += 1 + count * 4;
     } else {
       pn_write_register(natives.engine_, w[i] & 0xFFFF, w[i + 1], w[i] >> 16 & 0xF);
@@ -447,6 +452,18 @@ bool GfxNatives::nngx_add(Program& program, uint32_t function, uint32_t address,
 
 bool GfxNatives::call(Thread& thread, uint32_t which) {
   ++calls_[which];
+  // CTRN_NO_NATIVES=3,17: those left to the game's own code (to find which one draws wrong)
+  static const std::vector<uint32_t> off = [] {
+    std::vector<uint32_t> v;
+    for (const char* p = std::getenv("CTRN_NO_NATIVES"); p && *p;) {
+      char* end;
+      v.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 10)));
+      p = *end == ',' ? end + 1 : end;
+      if (end == p && *p) break;
+    }
+    return v;
+  }();
+  if (std::find(off.begin(), off.end(), which) != off.end()) return false;
   const uint32_t function = thread.ctx.r[15];
   const uint32_t* r = thread.ctx.r;
   Program program;
@@ -487,6 +504,32 @@ bool GfxNatives::call(Thread& thread, uint32_t which) {
   case kCopy:
     done = list_copy(r[0], r[1], r[2]);
     break;
+  case kGfxCamera: { // 0x170c74(ctx, camera, force): view (camera+0x148, 3 rows) in c90, projection (+0x1a8) in c86
+    Memory& m = kernel_.memory();
+    if (!lyt_.cursor) lyt_.cursor = literal(m, function + 0x18);
+    const uint32_t ctx = r[0], camera = r[1];
+    if (m.read32(ctx + 0x28) == camera && r[2] == 0) { done = true; break; }
+    m.write32(ctx + 0x28, camera);
+    // the game sends its rows reversed (x last): as a command list carries them
+    auto rows = [&](uint32_t at, uint32_t count) {
+      std::vector<uint32_t> w(count * 4);
+      for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < 4; ++k) w[i * 4 + k] = m.read32(at + i * 16 + (3 - k) * 4);
+      return w;
+    };
+    const auto view = rows(camera + 0x148, 3), projection = rows(camera + 0x1A8, 4);
+    program.uniforms(90, view), program.uniforms(86, projection);
+    program.uniforms(90, view, true), program.uniforms(86, projection, true);
+    done = true;
+    break;
+  }
+  case kGfxUniformBlock: { // 0x11eb1c(where, block): a shader unit's booleans and integers, 6 words, into the list
+    Memory& m = kernel_.memory();
+    if (!lyt_.cursor || r[0] != m.read32(lyt_.cursor)) break;
+    done = list_copy(r[0], r[1], 24);
+    if (done) thread.ctx.r[0] = r[0] + 24; // where it stopped: the caller's next command goes there
+    break;
+  }
   case kViewport: { // 0x488da4(rect {x, y, w, h}, where): the viewport's commands, written at `where`
     if (!lyt_.cursor) break; // the cursor learnt first (the words go into the current list)
     Memory& m = kernel_.memory();
