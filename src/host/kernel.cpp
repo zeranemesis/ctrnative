@@ -70,8 +70,7 @@ void start_host_thread(void (*body)(void*), void* argument) {
 #endif
 }
 
-Clock::time_point after_ns(uint64_t ns) {
-  const auto now = Clock::now();
+Clock::time_point after_ns(Clock::time_point now, uint64_t ns) {
   if (ns > uint64_t(365) * 24 * 3600 * 1000000000ull) return Clock::time_point::max();
   return now + std::chrono::nanoseconds(ns);
 }
@@ -101,8 +100,12 @@ Kernel::Kernel(Memory& memory, const Module& module) : memory_(memory), module_(
   host_ = Host{Callbacks::interpret, Callbacks::lookup, Callbacks::svc};
 }
 
+Clock::time_point Kernel::now() const {
+  return virtual_ ? start_ + std::chrono::nanoseconds(vt_ns_) : Clock::now();
+}
+
 uint64_t Kernel::ticks() const {
-  const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_).count();
+  const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now() - start_).count();
   return ns / 1000000000ull * kTicksPerSecond + ns % 1000000000ull * kTicksPerSecond / 1000000000ull;
 }
 
@@ -250,6 +253,7 @@ void Kernel::stop(const std::string& why) {
   // with or without the lock: only flags here
   if (!stopped_.exchange(true)) why_ = why;
   finished_.notify_all();
+  reached_.notify_all();
   wake_timekeeper_.notify_all();
 }
 
@@ -258,7 +262,7 @@ void Kernel::native_call(Thread& self, const std::function<void()>& work) {
   work();
   if (std::any_of(threads_.begin(), threads_.end(),
                   [&](auto& t) { return t.get() != &self && t->state == Thread::State::Ready; })) {
-    self.wake_at = Clock::now() + kRequest;
+    self.wake_at = now() + kRequest;
     self.state = Thread::State::Sleeping;
     block(self, lock);
   }
@@ -330,7 +334,7 @@ void Kernel::acquire(Object& object, Thread& waiter) {
 }
 
 void Kernel::pass() {
-  const auto now = Clock::now();
+  const auto now = this->now();
   // in thread-table order, as Zakuro: it decides who gets a contended object
   for (auto& t : threads_) {
     switch (t->state) {
@@ -420,8 +424,49 @@ void Kernel::block(Thread& self, std::unique_lock<std::mutex>& lock) {
   reschedule(self, lock);
 }
 
+void Kernel::advance_to(uint64_t ns, std::unique_lock<std::mutex>& lock) {
+  target_ns_ = ns;
+  wake_timekeeper_.notify_one();
+  reached_.wait(lock, [&] {
+    if (stopped_) return true;
+    if (running_) return false;
+    pass();
+    return !pick() && vt_ns_ >= target_ns_;
+  });
+}
+
+void Kernel::virtual_keeper(std::unique_lock<std::mutex>& lock) {
+  // CTRN_FIXED_STEP: time is the game's own. It moves only when no game thread can run: to the next deadline, or
+  // to where the host waits (its next audio block or frame), never by the host's clock; the same run, the same game
+  while (!stopped_) {
+    pass();
+    if (!running_) {
+      if (Thread* next = pick()) {
+        hand_to(next);
+      } else {
+        auto earliest = Clock::time_point::max();
+        for (auto& t : threads_)
+          if (t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
+              t->state == Thread::State::WaitArbiter)
+            earliest = std::min(earliest, t->wake_at);
+        const auto target = start_ + std::chrono::nanoseconds(target_ns_);
+        if (earliest <= target) {
+          if (earliest > now())
+            vt_ns_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - start_).count());
+          continue;
+        }
+        vt_ns_ = std::max(vt_ns_, target_ns_);
+        reached_.notify_all();
+      }
+    }
+    wake_timekeeper_.wait(lock);
+  }
+  reached_.notify_all();
+}
+
 void Kernel::timekeeper() {
   auto lock = this->lock();
+  if (virtual_) return virtual_keeper(lock);
   while (!stopped_) {
     pass();
     if (!running_) {
@@ -587,6 +632,8 @@ void Kernel::svc(Thread& self, uint32_t number) {
   uint32_t* r = c.r;
   auto lock = this->lock();
   ++svc_sites_[{number, r[14]}];
+  // the game's time moves on as it works; the host's natives (0xF0) cost it nothing: with or without them, the same run
+  if (virtual_ && number != 0xF0) vt_ns_ += kSvcNanoseconds;
   auto signed64 = [](uint32_t low, uint32_t high) { return static_cast<int64_t>(uint64_t{high} << 32 | low); };
   // a state change: whoever should run now runs (only higher priority preempts)
   auto yield = [&] { reschedule(self, lock); };
@@ -695,9 +742,9 @@ void Kernel::svc(Thread& self, uint32_t number) {
         return t.get() != &self && (t->state == Thread::State::Ready || t->state == Thread::State::Running);
       });
       if (!others) break;
-      self.wake_at = Clock::now() + kYield;
+      self.wake_at = now() + kYield;
     } else {
-      self.wake_at = after_ns(ns);
+      self.wake_at = after_ns(now(), ns);
     }
     self.state = Thread::State::Sleeping;
     block(self, lock);
@@ -875,7 +922,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     }
     if (type == 2 || type == 4) memory_.write32(address, static_cast<uint32_t>(current - 1));
     if (arbiter) arbiter->waiting.emplace_back(&self, address);
-    self.wake_at = (type == 3 || type == 4) && timeout >= 0 ? after_ns(static_cast<uint64_t>(timeout))
+    self.wake_at = (type == 3 || type == 4) && timeout >= 0 ? after_ns(now(), static_cast<uint64_t>(timeout))
                                                              : Clock::time_point::max();
     self.state = Thread::State::WaitArbiter;
     block(self, lock);
@@ -934,7 +981,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     }
     self.waiting = std::move(objects);
     self.wait_all = all;
-    self.wake_at = timeout < 0 ? Clock::time_point::max() : after_ns(static_cast<uint64_t>(timeout));
+    self.wake_at = timeout < 0 ? Clock::time_point::max() : after_ns(now(), static_cast<uint64_t>(timeout));
     self.state = Thread::State::WaitSync;
     block(self, lock);
     r[0] = self.result0;
@@ -994,7 +1041,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     // as Zakuro: a request lets the others run a little while
     if (std::any_of(threads_.begin(), threads_.end(),
                     [&](auto& t) { return t.get() != &self && t->state == Thread::State::Ready; })) {
-      self.wake_at = Clock::now() + kRequest;
+      self.wake_at = now() + kRequest;
       self.state = Thread::State::Sleeping;
       block(self, lock);
     }

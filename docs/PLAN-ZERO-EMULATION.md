@@ -77,6 +77,13 @@ Spec : `NSMB2-GFX.md`. Écrivains restants, mesurés dans la liste de la passe 3
 
 ## 4. Fiabilité : comparer sans dépendre du rythme du jeu
 
+**Fait le 2026-11-23 :**
+- **`CTRN_FIXED_STEP=1` : le temps du jeu est virtuel.**
+  - Il n'avance que quand aucun thread ne peut tourner : jusqu'à la prochaine échéance, au prochain bloc audio ou à la prochaine image. Chaque appel système compte 1 µs, sauf les natives.
+  - Les pipelines sont compilés de façon synchrone.
+  - Deux parties sont identiques à l'octet près, et elles vont plus vite (aucune attente de l'horloge).
+- **`tools/ab_natives.py` :** la même partie avec et sans natives, captures comparées octet par octet. NSMB2, 1 800 et 2 400 images : identiques.
+
 **Le problème :** une partie ne se rejoue pas à l'identique (le jeu suit l'horloge). Les captures divergent après quelques centaines d'images, et je vérifie alors à l'œil.
 
 **À faire :**

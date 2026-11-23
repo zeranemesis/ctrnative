@@ -232,7 +232,9 @@ int main(int argc, char** argv) {
       [](void* user, uint32_t address, uint32_t size) { return static_cast<host::Memory*>(user)->physical(address, size); },
       // CTRN_UNCACHED=1: no surfaces kept on the GPU, every one read back (4 times slower; captures
       // work either way, each copies its screen back from the GPU first)
-      &memory, (std::getenv("CTRN_UNCACHED") ? 0 : PN_CACHE_SURFACES) | PN_ASYNC_PIPELINES, message, sizeof message);
+      &memory,
+      (std::getenv("CTRN_UNCACHED") ? 0 : PN_CACHE_SURFACES) | (std::getenv("CTRN_FIXED_STEP") ? 0 : PN_ASYNC_PIPELINES),
+      message, sizeof message);
   if (!engine) {
     std::fprintf(stderr, "picanative: %s\n", message);
     return 2;
@@ -281,6 +283,10 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
   timeBeginPeriod(1); // waits to the millisecond: audio frames are 4.9 ms
 #endif
+  // CTRN_FIXED_STEP=1: the game's time is virtual, moved frame by frame and audio block by audio block: a run
+  // replays the same (same inputs, same pictures), to compare two builds picture by picture
+  const bool fixed_step = std::getenv("CTRN_FIXED_STEP") != nullptr;
+  kernel.set_virtual_time(fixed_step);
   kernel.start();
 
   // the DSP's clock: a frame of 160 samples at 32728 Hz, every 4.889 ms of real
@@ -294,12 +300,8 @@ int main(int argc, char** argv) {
     wav.open(path, std::ios::binary);
     wav.write(std::string(44, '\0').data(), 44); // the header once the size is known
   }
-  std::thread audio([&] {
-    const auto audio_period = std::chrono::nanoseconds(160ull * 1000000000ull / 32728);
-    auto due = std::chrono::steady_clock::now() + audio_period;
-    while (!kernel.stopped()) {
-      std::this_thread::sleep_until(due);
-      for (int late = 0; std::chrono::steady_clock::now() >= due && late < 8 && !kernel.stopped(); ++late) {
+  // one audio block: the DSP's frame, its samples to the window and the file
+  auto audio_block = [&] {
         std::vector<int16_t> samples;
         {
           auto lock = kernel.lock();
@@ -319,11 +321,22 @@ int main(int argc, char** argv) {
           }
           wav_samples += samples.size() / 2;
         }
+  };
+  const uint64_t audio_ns = 160ull * 1000000000ull / 32728;
+  std::thread audio([&] {
+    if (fixed_step) return; // the main loop runs the blocks at their virtual times
+    const auto audio_period = std::chrono::nanoseconds(audio_ns);
+    auto due = std::chrono::steady_clock::now() + audio_period;
+    while (!kernel.stopped()) {
+      std::this_thread::sleep_until(due);
+      for (int late = 0; std::chrono::steady_clock::now() >= due && late < 8 && !kernel.stopped(); ++late) {
+        audio_block();
         due += audio_period;
       }
       if (std::chrono::steady_clock::now() > due + audio_period * 8) due = std::chrono::steady_clock::now(); // far behind
     }
   });
+  uint64_t audio_at = 0; // fixed step: the virtual time of the last audio block
 
   // the console's refresh, 59.83 Hz: the screens' vertical blanks, and what the window shows
   const auto period = std::chrono::nanoseconds(16713668);
@@ -422,6 +435,20 @@ int main(int argc, char** argv) {
     }
     gfx_natives.frame();
     if (limit && ++frames >= limit) kernel.stop("frame limit reached");
+    if (fixed_step) { // the game runs up to its next frame, audio blocks on the way; no waiting for the host's clock
+      const uint64_t frame_at = frames * static_cast<uint64_t>(period.count());
+      while (!kernel.stopped() && audio_at + audio_ns <= frame_at) {
+        {
+          auto lock = kernel.lock();
+          kernel.advance_to(audio_at + audio_ns, lock);
+        }
+        audio_at += audio_ns;
+        audio_block();
+      }
+      auto lock = kernel.lock();
+      kernel.advance_to(frame_at, lock);
+      continue;
+    }
     next += period;
     const auto now = std::chrono::steady_clock::now();
     if (next < now - period * 4) next = now; // far behind: no catching up in a burst

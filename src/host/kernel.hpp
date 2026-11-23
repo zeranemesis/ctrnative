@@ -146,6 +146,11 @@ public:
   void stop(const std::string& why);   // ends the run with this reason
   Memory& memory() { return memory_; }
   uint64_t ticks() const;
+  // CTRN_FIXED_STEP: the game's time is virtual (set before start); the host moves it to `ns` (from the start) and
+  // waits until the game can do nothing more before then (with the lock)
+  void set_virtual_time(bool on) { virtual_ = on; }
+  bool virtual_time() const { return virtual_; }
+  void advance_to(uint64_t ns, std::unique_lock<std::mutex>& lock);
   // physical memory from the process's regions (bottom or top), 0 when out
   uint32_t allocate(int region, uint32_t size, bool top);
   void release(uint32_t physical, uint32_t size); // pages allocate gave, free again
@@ -173,6 +178,8 @@ private:
   bool signaled(const Object& object, const Thread& waiter) const;
   void acquire(Object& object, Thread& waiter);
   void timekeeper();
+  void virtual_keeper(std::unique_lock<std::mutex>& lock);
+  Clock::time_point now() const; // the host's clock, or the game's virtual one
   void map_tls(Thread& thread);
 
   Memory& memory_;
@@ -197,6 +204,10 @@ private:
   std::map<std::string, uint64_t> requests_;
   std::shared_ptr<Object> process_ = std::make_shared<Simple>(Object::Kind::Process);
   Clock::time_point start_ = Clock::now();
+  bool virtual_ = false;
+  uint64_t vt_ns_ = 0, target_ns_ = 0;
+  static constexpr uint64_t kSvcNanoseconds = 1000;
+  std::condition_variable reached_;
   Clock::time_point idle_since_{};
   Clock::duration idle_{};
 
