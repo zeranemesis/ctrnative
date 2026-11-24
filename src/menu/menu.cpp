@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -188,6 +189,48 @@ static void save_settings(const Settings& s) {
   std::ofstream f(settings_path(), std::ios::binary);
   f << "{\n  \"scale\": " << s.scale << ",\n  \"layout\": \"" << kLayouts[s.layout].name << "\",\n  \"roms\": "
     << json_string(s.roms) << ",\n  \"3dsrecomp\": " << json_string(s.recomp) << "\n}\n";
+}
+
+// ---- the cheats, as Luma3DS has them: <cheats>/<title ID>.txt ([name] then code lines), the ones on in
+// <title ID>.on, one name a line (read by tools/ctrn.py); none on by default ----
+struct Cheat { std::string name; int lines = 0; bool on = false; };
+static fs::path cheats_path(uint64_t title_id, const char* ext) {
+  const wchar_t* dir = _wgetenv(L"CTRN_CHEATS_DIR");
+  char name[32];
+  std::snprintf(name, sizeof name, "%016llX.%s", static_cast<unsigned long long>(title_id), ext);
+  return (dir && *dir ? fs::path(dir) : cache_dir() / "cheats") / name;
+}
+static std::string trim(std::string s) { // as the host trims: the names must match its own
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+  return s.erase(0, std::min(s.size(), s.find_first_not_of(" \t\r\n\v\f")));
+}
+// false when the game has no file of codes
+static bool load_cheats(uint64_t title_id, std::vector<Cheat>& out) {
+  out.clear();
+  std::ifstream codes(cheats_path(title_id, "txt"), std::ios::binary);
+  if (!codes) return false;
+  std::vector<std::string> on;
+  std::ifstream on_file(cheats_path(title_id, "on"), std::ios::binary);
+  for (std::string l; std::getline(on_file, l);)
+    if (!(l = trim(l)).empty()) on.push_back(l.starts_with("\xEF\xBB\xBF") ? l.substr(3) : l);
+  for (std::string l; std::getline(codes, l);) {
+    if (l.starts_with("\xEF\xBB\xBF")) l.erase(0, 3);
+    if ((l = trim(l)).empty() || l[0] == '#' || l[0] == ';') continue;
+    unsigned a = 0, b = 0;
+    if (l.front() == '[' && l.back() == ']') {
+      Cheat c{trim(l.substr(1, l.size() - 2))};
+      c.on = std::find(on.begin(), on.end(), c.name) != on.end();
+      out.push_back(c);
+    } else if (!out.empty() && std::sscanf(l.c_str(), "%8x %8x", &a, &b) == 2) ++out.back().lines;
+  }
+  return true;
+}
+static void save_cheats(uint64_t title_id, const std::vector<Cheat>& cheats) {
+  const fs::path path = cheats_path(title_id, "on");
+  std::error_code e;
+  if (std::none_of(cheats.begin(), cheats.end(), [](const Cheat& c) { return c.on; })) { fs::remove(path, e); return; }
+  std::ofstream f(path, std::ios::binary);
+  for (const Cheat& c : cheats) if (c.on) f << c.name << "\n";
 }
 
 // ---- text: drawn by GDI (any character of the titles, smoothed) into textures, kept by content ----
@@ -414,7 +457,7 @@ static void icon(Where s, const Game& g, float x, float y, float size) {
 static bool inside(float px, float py, float x, float y, float w, float h) { return px >= x && px < x + w && py >= y && py < y + h; }
 
 // ---- the screens ----
-enum class Page { Home, Settings, Launch };
+enum class Page { Home, Settings, Cheats, Launch };
 static const uint32_t kAccent = 0x1E88E5, kInk = 0x26303B, kMuted = 0x66717E;
 static const int kColumns = 5, kRows = 3; // the grid on the bottom screen: cells of 60, from (10, 30)
 
@@ -504,6 +547,10 @@ int main(int argc, char** argv) {
   uint64_t deaf_until = 0, last_window_check = 0;
   std::wstring error;
   bool quit = false;
+  std::vector<Cheat> cheats; // the chosen game's, on the Cheats page
+  bool has_cheats = false;
+  int cheat = 0, cheat_top = 0;
+  const int kCheatRows = 6;
 
   auto keep_visible = [&] {
     const int row = selected / kColumns;
@@ -545,7 +592,7 @@ int main(int argc, char** argv) {
     page = Page::Home;
   };
 
-  enum Action { NONE, UP, DOWN, LEFT_, RIGHT_, A, B, Y, QUIT };
+  enum Action { NONE, UP, DOWN, LEFT_, RIGHT_, A, B, X, Y, QUIT };
   auto act = [&](Action a) {
     if (a == NONE || SDL_GetTicks() < deaf_until) return;
     if (page == Page::Home) {
@@ -557,7 +604,15 @@ int main(int argc, char** argv) {
       if (a == DOWN && selected / kColumns < (games_count - 1) / kColumns) selected = std::min(selected + kColumns, games_count - 1);
       if (a == A) launch(selected);
       if (a == Y) page = Page::Settings, option = 0;
+      if (a == X) page = Page::Cheats, has_cheats = load_cheats(games[selected].title_id, cheats), cheat = cheat_top = 0;
       keep_visible();
+    } else if (page == Page::Cheats) {
+      const int n = int(cheats.size());
+      if (a == UP && cheat > 0) --cheat;
+      if (a == DOWN && cheat + 1 < n) ++cheat;
+      if (a == A && cheat < n) cheats[cheat].on = !cheats[cheat].on, save_cheats(games[selected].title_id, cheats);
+      if (a == B || a == QUIT || a == X) page = Page::Home;
+      cheat_top = std::clamp(cheat_top, std::max(0, cheat - kCheatRows + 1), cheat);
     } else if (page == Page::Settings) {
       if (a == UP || a == DOWN) option ^= 1;
       if (a == LEFT_ || a == RIGHT_) {
@@ -576,6 +631,7 @@ int main(int argc, char** argv) {
     if (SDL_GetTicks() < deaf_until) return;
     if (page == Page::Home) {
       if (inside(x, y, 236, 3, 78, 20)) return act(Y);
+      if (inside(x, y, 152, 3, 78, 20)) return act(X);
       for (int i = top_row * kColumns; i < std::min(games_count, (top_row + kRows) * kColumns); ++i) {
         const float cx = 10 + i % kColumns * 60.f, cy = 32 + (i / kColumns - top_row) * 60.f;
         if (!inside(x, y, cx, cy, 60, 60)) continue;
@@ -590,6 +646,10 @@ int main(int argc, char** argv) {
           option = i;
           if (x >= 180) act(x < 245 ? LEFT_ : RIGHT_);
         }
+    } else if (page == Page::Cheats) {
+      if (inside(x, y, 236, 3, 78, 20)) return act(B);
+      const int i = cheat_top + int((y - 32) / 30);
+      if (y >= 32 && y < 32 + kCheatRows * 30 && i < int(cheats.size())) cheat = i, act(A);
     } else act(run && !run->finished ? B : A);
   };
 
@@ -606,6 +666,7 @@ int main(int argc, char** argv) {
         act(k == SDLK_UP || k == SDLK_W ? UP : k == SDLK_DOWN || k == SDLK_S ? DOWN : k == SDLK_LEFT || k == SDLK_A ? LEFT_
             : k == SDLK_RIGHT || k == SDLK_D ? RIGHT_ : k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE || k == SDLK_X || k == SDLK_J ? A
             : k == SDLK_BACKSPACE || k == SDLK_C || k == SDLK_K || k == SDLK_LSHIFT ? B : k == SDLK_TAB || k == SDLK_V || k == SDLK_I ? Y
+            : k == SDLK_F2 || k == SDLK_U ? X
             : k == SDLK_ESCAPE ? (page == Page::Home ? QUIT : B) : NONE);
       }
       if (e.type == SDL_EVENT_GAMEPAD_ADDED)
@@ -614,7 +675,8 @@ int main(int argc, char** argv) {
         const int b = e.gbutton.button; // the console's layout, as picanative maps it: A east, B south
         act(b == SDL_GAMEPAD_BUTTON_DPAD_UP ? UP : b == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? DOWN : b == SDL_GAMEPAD_BUTTON_DPAD_LEFT ? LEFT_
             : b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT ? RIGHT_ : b == SDL_GAMEPAD_BUTTON_EAST || b == SDL_GAMEPAD_BUTTON_START ? A
-            : b == SDL_GAMEPAD_BUTTON_SOUTH ? B : b == SDL_GAMEPAD_BUTTON_WEST || b == SDL_GAMEPAD_BUTTON_BACK ? Y : NONE);
+            : b == SDL_GAMEPAD_BUTTON_SOUTH ? B : b == SDL_GAMEPAD_BUTTON_WEST || b == SDL_GAMEPAD_BUTTON_BACK ? Y
+            : b == SDL_GAMEPAD_BUTTON_NORTH ? X : NONE);
       }
       if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.axis <= SDL_GAMEPAD_AXIS_LEFTY) {
         const int axis = e.gaxis.axis, now = e.gaxis.value > 16000 ? 1 : e.gaxis.value < -16000 ? -1 : 0;
@@ -625,7 +687,7 @@ int main(int argc, char** argv) {
         SDL_ConvertEventToRenderCoordinates(g_renderer, &e);
         touch((e.button.x - g_x[BOTTOM]) / g_k, (e.button.y - g_y[BOTTOM]) / g_k);
       }
-      if (e.type == SDL_EVENT_MOUSE_WHEEL && page == Page::Home) act(e.wheel.y > 0 ? UP : e.wheel.y < 0 ? DOWN : NONE);
+      if (e.type == SDL_EVENT_MOUSE_WHEEL && (page == Page::Home || page == Page::Cheats)) act(e.wheel.y > 0 ? UP : e.wheel.y < 0 ? DOWN : NONE);
     } while (!quit && SDL_PollEvent(&e));
 
     // the game: its window found, the menu steps aside; the launcher stopped, it comes back
@@ -671,7 +733,12 @@ int main(int argc, char** argv) {
       }
       wchar_t heading[64];
       swprintf(heading, 64, L"Jeux (%d)", games_count);
-      bottom_bars(heading, L"Réglages", L"A / Entrée : jouer      Y / Tab : réglages      Échap : quitter");
+      bottom_bars(heading, L"Réglages", L"A / Entrée : jouer     X / F2 : codes     Y / Tab : réglages     Échap : quitter");
+      if (games_count) {
+        fill(BOTTOM, 152, 3, 78, 20, 0xFFFFFF);
+        frame(BOTTOM, 152, 3, 78, 20, 1, 0xAEB8C4);
+        text(BOTTOM, 191, 5, L"Codes", {12, kInk, false, false, false, CENTER});
+      }
       for (int i = top_row * kColumns; i < std::min(games_count, (top_row + kRows) * kColumns); ++i) {
         const float cx = 10 + i % kColumns * 60.f, cy = 32 + (i / kColumns - top_row) * 60.f;
         if (i == selected) fill(BOTTOM, cx + 2, cy + 2, 56, 56, kAccent);
@@ -707,6 +774,41 @@ int main(int argc, char** argv) {
         text(BOTTOM, 186, y + 9, L"‹", {17, i == option ? kAccent : kMuted, true});
         text(BOTTOM, 246, y + 12, values[i], {12, kInk, false, false, false, CENTER}, 110);
         text(BOTTOM, 300, y + 9, L"›", {17, i == option ? kAccent : kMuted, true, false, false, RIGHT});
+      }
+    } else if (page == Page::Cheats) {
+      const Game& g = games[selected];
+      game_card(g, 30);
+      const int on = int(std::count_if(cheats.begin(), cheats.end(), [](const Cheat& c) { return c.on; }));
+      wchar_t t[120];
+      if (!has_cheats) {
+        chip(170, 0xEF8A17, L"Aucun fichier de codes pour ce jeu. Placez-le ici :");
+        const fs::path p = cheats_path(g.title_id, "txt"); // folder and name apart: a path has no space to wrap at
+        text(TOP, 40, 186, p.parent_path().wstring() + L"\\", {10.5f, kInk, false, true}, 344);
+        text(TOP, 40, 200, p.filename().wstring(), {10.5f, kInk, true, true}, 344);
+        text(TOP, 40, 217, L"Format Luma3DS : [Nom du code] puis des lignes XXXXXXXX YYYYYYYY", {10, kMuted}, 344);
+      } else {
+        if (on) swprintf(t, 120, L"%d code%ls actif%ls sur %d, au prochain lancement", on, on > 1 ? L"s" : L"", on > 1 ? L"s" : L"", int(cheats.size()));
+        else swprintf(t, 120, L"Aucun code actif : le jeu d'origine (%d code%ls dans le fichier)", int(cheats.size()), cheats.size() > 1 ? L"s" : L"");
+        chip(170, on ? 0xEF8A17 : 0x2E9D4A, t);
+        text(TOP, 40, 190, cheats_path(g.title_id, "txt").wstring(), {10, kMuted}, 344);
+      }
+      wchar_t heading[64];
+      swprintf(heading, 64, L"Codes (%d)", int(cheats.size()));
+      bottom_bars(heading, L"Retour", L"↑ ↓ : choisir      A / Entrée : cocher      B / Échap : retour");
+      if (has_cheats && cheats.empty()) text(BOTTOM, 160, 100, L"Le fichier ne contient aucun « [Nom] ».", {12, kMuted, false, false, false, CENTER});
+      for (int i = cheat_top; i < std::min(int(cheats.size()), cheat_top + kCheatRows); ++i) {
+        const float y = 32 + (i - cheat_top) * 30.f;
+        fill(BOTTOM, 6, y, 308, 27, 0xFFFFFF);
+        if (i == cheat) frame(BOTTOM, 6, y, 308, 27, 2, kAccent);
+        frame(BOTTOM, 14, y + 7, 13, 13, 1.5f, cheats[i].on ? kAccent : 0x8A96A3);
+        if (cheats[i].on) fill(BOTTOM, 17, y + 10, 7, 7, kAccent);
+        text(BOTTOM, 36, y + 6, widen(cheats[i].name), {12, kInk, cheats[i].on}, 220);
+        swprintf(t, 120, L"%d ligne%ls", cheats[i].lines, cheats[i].lines > 1 ? L"s" : L"");
+        text(BOTTOM, 306, y + 7, t, {10, kMuted, false, false, false, RIGHT});
+      }
+      if (int(cheats.size()) > kCheatRows) {
+        fill(BOTTOM, 316, 32, 2, 180, 0xC9D0D8);
+        fill(BOTTOM, 316, 32 + 180.f * cheat_top / cheats.size(), 2, 180.f * kCheatRows / cheats.size(), 0x8A96A3);
       }
     } else if (running >= 0) {
       const Game& g = games[running];

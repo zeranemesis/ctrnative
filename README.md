@@ -68,6 +68,9 @@ jeux en bas (lues dans la ROM), le jeu choisi en haut, ses réglages (échelle d
 rendu, disposition des écrans), et le lancement par `tools/ctrn.py` avec sa
 sortie à l'écran ; le menu revient quand le jeu se ferme. Souris (un clic
 choisit, un second lance), clavier (flèches, Entrée, Tab, Échap) ou manette.
+La page « Codes » (X, F2) coche les cheats du jeu choisi : elle lit
+`<cheats>/<id du jeu>.txt` et écrit les noms cochés dans `<id du jeu>.on`, que
+`tools/ctrn.py` passe à l'hôte ; rien n'est coché par défaut.
 
 ```bash
 cmake -S src/menu -B build-menu -G Ninja -DCMAKE_BUILD_TYPE=Release \
