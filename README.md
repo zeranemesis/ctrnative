@@ -76,9 +76,9 @@ désactivées par défaut (le jeu tel qu'il est) : filtre, FXAA, accentuation,
 couleurs de l'écran 3DS, lignes de balayage, filtrage anisotrope, mipmaps, 3D,
 pack de textures (`%LOCALAPPDATA%\ctrnative\textures\<id du jeu>`). En jeu, **F1**
 ouvre un menu par-dessus l'image et met le jeu en pause : filtre, effets et 3D
-changent aussitôt, l'anisotropie et les mipmaps à la reprise (textures
-rechargées). Il demande le `pn_set_texture_options` de picanative (branche
-`menu`).
+changent aussitôt, l'échelle, l'anisotropie et les mipmaps à la reprise (rendu
+rechargé). Il demande le picanative de la branche `menu` (`pn_set_texture_options`,
+`pn_set_resolution_scale` en cours de partie).
 
 ```bash
 cmake -S src/menu -B build-menu -G Ninja -DCMAKE_BUILD_TYPE=Release \
