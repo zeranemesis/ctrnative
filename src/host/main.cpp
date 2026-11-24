@@ -13,6 +13,7 @@
 #include "native.hpp"
 #include "rom.hpp"
 #include "input.hpp"
+#include "overlay.hpp"
 #include "services.hpp"
 #include "trace.hpp"
 #include "y2r.hpp"
@@ -351,20 +352,30 @@ int main(int argc, char** argv) {
     look = pn_offscreen_open(engine, static_cast<uint32_t>(std::max(1, std::atoi(shot_scale))));
   // improvements to how the screens are shown, off by default: CTRN_FILTER bilinear (the default), nearest or
   // sharp; CTRN_EFFECTS a list of fxaa, sharpen, lcd (the 3DS screen's colors), scanlines
-  for (pn_window* target : {window, look}) {
-    if (!target) continue;
-    pn_window* window = target;
+  // PN_ANISOTROPY and PN_MIPMAPS (picanative reads them; F1 changes them during the game, as the others)
+  host::Look settings_look;
+  {
     const std::string filter = std::getenv("CTRN_FILTER") ? std::getenv("CTRN_FILTER") : "";
     const std::string effects = std::getenv("CTRN_EFFECTS") ? std::getenv("CTRN_EFFECTS") : "";
-    uint32_t mask = 0;
-    if (effects.find("fxaa") != std::string::npos) mask |= PN_EFFECT_FXAA;
-    if (effects.find("sharpen") != std::string::npos) mask |= PN_EFFECT_SHARPEN;
-    if (effects.find("lcd") != std::string::npos) mask |= PN_EFFECT_LCD_COLORS;
-    if (effects.find("scanlines") != std::string::npos) mask |= PN_EFFECT_SCANLINES;
-    pn_window_set_filter(window, filter == "nearest" ? 1 : filter == "sharp" ? 2 : 0, mask);
     const std::string stereo = std::getenv("CTRN_STEREO") ? std::getenv("CTRN_STEREO") : "";
-    pn_window_set_stereo(window, stereo == "anaglyph" ? 1 : stereo == "sbs" ? 2 : 0);
+    settings_look.filter = filter == "nearest" ? 1 : filter == "sharp" ? 2 : 0;
+    if (effects.find("fxaa") != std::string::npos) settings_look.effects |= PN_EFFECT_FXAA;
+    if (effects.find("sharpen") != std::string::npos) settings_look.effects |= PN_EFFECT_SHARPEN;
+    if (effects.find("lcd") != std::string::npos) settings_look.effects |= PN_EFFECT_LCD_COLORS;
+    if (effects.find("scanlines") != std::string::npos) settings_look.effects |= PN_EFFECT_SCANLINES;
+    settings_look.stereo = stereo == "anaglyph" ? 1 : stereo == "sbs" ? 2 : 0;
+    const int anisotropy = std::getenv("PN_ANISOTROPY") ? std::atoi(std::getenv("PN_ANISOTROPY")) : 0;
+    for (int n : {2, 4, 8, 16}) // the menu's steps
+      if (anisotropy >= n) settings_look.anisotropy = n;
+    settings_look.mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
   }
+  const auto apply_look = [&](const host::Look& l) {
+    for (pn_window* target : {window, look})
+      if (target) pn_window_set_filter(target, static_cast<uint32_t>(l.filter), static_cast<uint32_t>(l.effects)),
+                  pn_window_set_stereo(target, l.stereo);
+    pn_set_texture_options(engine, l.anisotropy, l.mipmaps);
+  };
+  apply_look(settings_look);
   // how the screens share the window: CTRN_LAYOUT stacked (the console's), side, large or top (F10 cycles them)
   if (const char* layout = std::getenv("CTRN_LAYOUT"); window && layout) {
     const std::string name = layout;
@@ -502,6 +513,34 @@ int main(int argc, char** argv) {
     if (window && !pn_window_poll(window, &input)) {
       kernel.stop("the window was closed");
       break;
+    }
+    // F1: the settings over the game, the game paused (its threads wait for the kernel's lock, the sound too)
+    if (window && host::overlay_asked()) {
+      bool open = true;
+      {
+        auto lock = kernel.lock();
+        const auto screens = gsp.screens();
+        // the 3D slider follows (all the way up with 3D on, as CTRN_STEREO sets it at the start): the game draws
+        // the right eye, or stops
+        const auto apply_in_game = [&](const host::Look& l) {
+          apply_look(l);
+          const float slider = l.stereo ? 1.0f : 0.0f;
+          memory.write_any(0x1FF81080, &slider, 4);
+        };
+        host::overlay_run(settings_look, apply_in_game, [&](unsigned& buttons) {
+          pn_input now{};
+          open = pn_window_poll(window, &now) != 0;
+          buttons = now.buttons;
+          if (open) pn_window_present(window, screens.data());
+          return open;
+        });
+      }
+      next = std::chrono::steady_clock::now();
+      if (!open) {
+        kernel.stop("the window was closed");
+        break;
+      }
+      continue;
     }
     host::Services::Input frame_input{input.buttons, input.circle_x, input.circle_y, input.touch_x, input.touch_y,
                                       input.touching != 0};

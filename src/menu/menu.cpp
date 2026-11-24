@@ -138,16 +138,44 @@ static std::vector<Game> find_games(const std::wstring& folders) {
 }
 
 // ---- the settings, kept in menu.json ----
-struct Layout { const char* name; const wchar_t* label; const wchar_t* about; };
-static const Layout kLayouts[] = {
-  {"stacked", L"Console", L"Les deux écrans l'un au-dessus de l'autre, comme sur la console."},
-  {"side", L"Côte à côte", L"Les deux écrans côte à côte, pour un moniteur large."},
-  {"large", L"Grand écran du haut", L"L'écran du haut en grand, celui du bas en petit à côté."},
-  {"top", L"Écran du haut seul", L"L'écran du haut seul (le tactile est alors coupé)."},
+// each setting: an index into its values, 0 the game as it is (the console's look) except the layout's
+enum { SCALE, LAYOUT, FILTER, FXAA, SHARPEN, LCD, SCANLINES, ANISOTROPY, MIPMAPS, STEREO, PACK, kChoices };
+struct Choice {
+  const char* key;                     // in menu.json
+  const wchar_t* label;
+  std::vector<const char*> names;      // in menu.json and in the variable passed to the game
+  std::vector<const wchar_t*> values;  // shown
+  const wchar_t* about;
+};
+static const Choice kChoices_[kChoices] = {
+  {"scale", L"Échelle de rendu", {"1", "2", "3", "4"}, {L"1× (défaut)", L"2×", L"3×", L"4×"},
+   L"La résolution interne du rendu, en multiple de celle de la console. 1× donne les pixels d'origine (défaut)."},
+  {"layout", L"Disposition", {"stacked", "side", "large", "top"}, {L"Console", L"Côte à côte", L"Grand haut", L"Haut seul"},
+   L"Comment les deux écrans se partagent la fenêtre (F10 en jeu). « Console » : l'un au-dessus de l'autre."},
+  {"filter", L"Filtre de l'image", {"bilinear", "nearest", "sharp"}, {L"Désactivé", L"Pixels nets", L"Net lissé"},
+   L"Comment l'image est agrandie à la taille de la fenêtre. Pixels nets : sans lissage ; net lissé : les pixels "
+   L"restent nets, seuls leurs bords sont adoucis. Désactivé : lissage bilinéaire, comme jusqu'ici."},
+  {"fxaa", L"Anticrénelage (FXAA)", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Adoucit les bords en escalier des objets 3D, sur l'image finale."},
+  {"sharpen", L"Accentuation", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Rend l'image plus nette après l'agrandissement."},
+  {"lcd", L"Couleurs de l'écran 3DS", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Imite les couleurs plus ternes de l'écran LCD de la console."},
+  {"scanlines", L"Lignes de balayage", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Assombrit une ligne sur deux, façon écran cathodique."},
+  {"anisotropy", L"Filtrage anisotrope", {"0", "2", "4", "8", "16"}, {L"Désactivé", L"2×", L"4×", L"8×", L"16×"},
+   L"Des textures plus nettes quand on les voit de biais (sols, routes)."},
+  {"mipmaps", L"Mipmaps", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Des versions réduites des textures qui n'en ont pas : moins de scintillement au loin."},
+  {"stereo", L"3D", {"off", "anaglyph", "sbs"}, {L"Désactivé", L"Anaglyphe", L"Côte à côte"},
+   L"L'écran du haut en relief, quand le jeu dessine les deux yeux. Anaglyphe : lunettes rouge et cyan ; "
+   L"côte à côte : pour une télévision 3D ou un casque."},
+  {"texture_pack", L"Pack de textures", {"off", "on"}, {L"Désactivé", L"Activé"},
+   L"Remplace les textures du jeu par celles du dossier %LOCALAPPDATA%\\ctrnative\\textures\\<id du jeu> "
+   L"(fichiers .tga nommés par leur contenu)."},
 };
 struct Settings {
-  int scale = 2;  // CTRN_SCALE, 1 to 4
-  int layout = 0; // kLayouts
+  int choice[kChoices] = {}; // all 0: the game as it is
   std::wstring roms = L"C:\\jeu 3ds\\extrait;C:\\jeu 3ds";
   std::wstring recomp; // 3dsrecomp's executable, empty: CTRN_3DSRECOMP or found beside the repository
 };
@@ -176,9 +204,11 @@ static Settings load_settings() {
   Settings s;
   std::ifstream f(settings_path(), std::ios::binary);
   const std::string text((std::istreambuf_iterator<char>(f)), {});
-  if (const std::string v = json_value(text, "scale"); !v.empty()) s.scale = std::clamp(std::atoi(v.c_str()), 1, 4);
-  for (int i = 0; i < 4; ++i)
-    if (json_value(text, "layout") == kLayouts[i].name) s.layout = i;
+  for (int c = 0; c < kChoices; ++c) {
+    const std::string v = json_value(text, kChoices_[c].key);
+    for (size_t i = 0; i < kChoices_[c].names.size(); ++i)
+      if (v == kChoices_[c].names[i]) s.choice[c] = int(i);
+  }
   if (const std::string v = json_value(text, "roms"); !v.empty()) s.roms = widen(v);
   s.recomp = widen(json_value(text, "3dsrecomp"));
   return s;
@@ -187,8 +217,9 @@ static void save_settings(const Settings& s) {
   std::error_code e;
   fs::create_directories(cache_dir(), e);
   std::ofstream f(settings_path(), std::ios::binary);
-  f << "{\n  \"scale\": " << s.scale << ",\n  \"layout\": \"" << kLayouts[s.layout].name << "\",\n  \"roms\": "
-    << json_string(s.roms) << ",\n  \"3dsrecomp\": " << json_string(s.recomp) << "\n}\n";
+  f << "{\n";
+  for (int c = 0; c < kChoices; ++c) f << "  \"" << kChoices_[c].key << "\": \"" << kChoices_[c].names[s.choice[c]] << "\",\n";
+  f << "  \"roms\": " << json_string(s.roms) << ",\n  \"3dsrecomp\": " << json_string(s.recomp) << "\n}\n";
 }
 
 // ---- the cheats, as Luma3DS has them: <cheats>/<title ID>.txt ([name] then code lines), the ones on in
@@ -551,6 +582,8 @@ int main(int argc, char** argv) {
   bool has_cheats = false;
   int cheat = 0, cheat_top = 0;
   const int kCheatRows = 6;
+  int option_top = 0;
+  const int kOptionRows = 7;
 
   auto keep_visible = [&] {
     const int row = selected / kColumns;
@@ -570,8 +603,24 @@ int main(int argc, char** argv) {
           recomp = root.parent_path() / guess / "target" / "release" / "3dsrecomp.exe";
       if (!recomp.empty()) command += L" --3dsrecomp \"" + recomp.wstring() + L"\"";
     }
-    SetEnvironmentVariableW(L"CTRN_SCALE", std::to_wstring(settings.scale).c_str());
-    SetEnvironmentVariableW(L"CTRN_LAYOUT", widen(kLayouts[settings.layout].name).c_str());
+    // the settings, as the host and picanative read them; a setting off sets nothing (the game as it is)
+    const int* c = settings.choice;
+    auto pass = [](const wchar_t* name, const std::string& value) {
+      SetEnvironmentVariableW(name, value.empty() ? nullptr : widen(value).c_str());
+    };
+    pass(L"CTRN_SCALE", kChoices_[SCALE].names[c[SCALE]]);
+    pass(L"CTRN_LAYOUT", kChoices_[LAYOUT].names[c[LAYOUT]]);
+    pass(L"CTRN_FILTER", c[FILTER] ? kChoices_[FILTER].names[c[FILTER]] : "");
+    std::string effects;
+    for (int e : {FXAA, SHARPEN, LCD, SCANLINES})
+      if (c[e]) effects += (effects.empty() ? "" : ",") + std::string(kChoices_[e].key);
+    pass(L"CTRN_EFFECTS", effects);
+    pass(L"PN_ANISOTROPY", c[ANISOTROPY] ? kChoices_[ANISOTROPY].names[c[ANISOTROPY]] : "");
+    pass(L"PN_MIPMAPS", c[MIPMAPS] ? "1" : "");
+    pass(L"CTRN_STEREO", c[STEREO] ? kChoices_[STEREO].names[c[STEREO]] : "");
+    char id[20];
+    std::snprintf(id, sizeof id, "%016llX", static_cast<unsigned long long>(g.title_id));
+    pass(L"PN_TEXTURE_PACK", c[PACK] ? narrow((cache_dir() / "textures" / id).wstring()) : "");
     SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
     if (fs::is_directory(L"C:\\Program Files\\LLVM\\bin")) { // clang, for the module's compilation
       std::wstring path(32767, L'\0');
@@ -614,14 +663,15 @@ int main(int argc, char** argv) {
       if (a == B || a == QUIT || a == X) page = Page::Home;
       cheat_top = std::clamp(cheat_top, std::max(0, cheat - kCheatRows + 1), cheat);
     } else if (page == Page::Settings) {
-      if (a == UP || a == DOWN) option ^= 1;
-      if (a == LEFT_ || a == RIGHT_) {
-        const int step = a == LEFT_ ? -1 : 1;
-        if (option == 0) settings.scale = std::clamp(settings.scale + step, 1, 4);
-        else settings.layout = (settings.layout + step + 4) % 4;
+      if (a == UP && option > 0) --option;
+      if (a == DOWN && option + 1 < kChoices) ++option;
+      if (a == LEFT_ || a == RIGHT_ || a == A) {
+        const int n = int(kChoices_[option].values.size());
+        settings.choice[option] = (settings.choice[option] + (a == LEFT_ ? n - 1 : 1)) % n;
         save_settings(settings);
       }
       if (a == B || a == QUIT || a == Y) page = Page::Home;
+      option_top = std::clamp(option_top, std::max(0, option - kOptionRows + 1), option);
     } else if (run) {
       if (!run->finished && (a == B || a == QUIT)) run->cancel();
       else if (run->finished && (a == A || a == B || a == QUIT)) back_home();
@@ -641,11 +691,11 @@ int main(int argc, char** argv) {
       }
     } else if (page == Page::Settings) {
       if (inside(x, y, 236, 3, 78, 20)) return act(B);
-      for (int i = 0; i < 2; ++i)
-        if (inside(x, y, 8, 36 + i * 46.f, 304, 40)) {
-          option = i;
-          if (x >= 180) act(x < 245 ? LEFT_ : RIGHT_);
-        }
+      const int i = option_top + int((y - 32) / 26);
+      if (y >= 32 && y < 32 + kOptionRows * 26 && i < kChoices) {
+        option = i;
+        if (x >= 180) act(x < 245 ? LEFT_ : RIGHT_);
+      }
     } else if (page == Page::Cheats) {
       if (inside(x, y, 236, 3, 78, 20)) return act(B);
       const int i = cheat_top + int((y - 32) / 30);
@@ -753,28 +803,24 @@ int main(int argc, char** argv) {
       }
     } else if (page == Page::Settings) {
       text(TOP, 22, 28, L"Réglages", {20, kInk, true});
-      static const wchar_t* about[2] = {
-        L"La résolution interne du rendu, en multiple de celle de la console. 1× donne les pixels d'origine ; "
-        L"2× est le réglage par défaut de ctrnative.",
-        nullptr};
       fill(TOP, 16, 62, 368, 112, 0xFFFFFF);
-      text(TOP, 28, 72, option == 0 ? L"Échelle de rendu" : L"Disposition des écrans", {14, kInk, true});
-      text(TOP, 28, 94, option == 0 ? about[0] : kLayouts[settings.layout].about, {12.5f, 0x3B4552, false, false, true}, 344);
-      text(TOP, 22, 186, L"Pris en compte au prochain lancement d'un jeu. En jeu : F10 change la disposition, F11 le plein écran, "
-                         L"Échap ferme le jeu.", {11, kMuted, false, false, true}, 356);
+      text(TOP, 28, 72, kChoices_[option].label, {14, kInk, true});
+      text(TOP, 28, 94, kChoices_[option].about, {12, 0x3B4552, false, false, true}, 344);
+      text(TOP, 22, 186, L"Pris en compte au prochain lancement d'un jeu ; en jeu, F1 ouvre ces réglages. Tout désactivé : "
+                         L"le jeu tel qu'il est sur la console.", {11, kMuted, false, false, true}, 356);
       bottom_bars(L"Réglages", L"Retour", L"↑ ↓ : choisir      ← → : changer      B / Échap : retour");
-      const std::wstring values[2] = {std::to_wstring(settings.scale) + L"×" + (settings.scale == 2 ? L" (défaut)" : L""),
-                                      kLayouts[settings.layout].label};
-      const wchar_t* labels[2] = {L"Échelle de rendu", L"Disposition"};
-      for (int i = 0; i < 2; ++i) {
-        const float y = 36 + i * 46.f;
-        fill(BOTTOM, 8, y, 304, 40, 0xFFFFFF);
-        if (i == option) frame(BOTTOM, 8, y, 304, 40, 2, kAccent);
-        text(BOTTOM, 18, y + 12, labels[i], {12.5f, kInk, true}, 150);
-        text(BOTTOM, 186, y + 9, L"‹", {17, i == option ? kAccent : kMuted, true});
-        text(BOTTOM, 246, y + 12, values[i], {12, kInk, false, false, false, CENTER}, 110);
-        text(BOTTOM, 300, y + 9, L"›", {17, i == option ? kAccent : kMuted, true, false, false, RIGHT});
+      for (int i = option_top; i < std::min<int>(kChoices, option_top + kOptionRows); ++i) {
+        const float y = 32 + (i - option_top) * 26.f;
+        fill(BOTTOM, 6, y, 306, 24, 0xFFFFFF);
+        if (i == option) frame(BOTTOM, 6, y, 306, 24, 2, kAccent);
+        text(BOTTOM, 14, y + 5, kChoices_[i].label, {11.5f, kInk, true}, 166);
+        text(BOTTOM, 186, y + 2, L"‹", {15, i == option ? kAccent : kMuted, true});
+        text(BOTTOM, 246, y + 5, kChoices_[i].values[settings.choice[i]], {11.5f, settings.choice[i] && i != LAYOUT ? kAccent : kInk,
+             false, false, false, CENTER}, 104);
+        text(BOTTOM, 302, y + 2, L"›", {15, i == option ? kAccent : kMuted, true, false, false, RIGHT});
       }
+      fill(BOTTOM, 315, 32, 2, 180, 0xC9D0D8);
+      fill(BOTTOM, 315, 32 + 180.f * option_top / int(kChoices), 2, 180.f * kOptionRows / int(kChoices), 0x8A96A3);
     } else if (page == Page::Cheats) {
       const Game& g = games[selected];
       game_card(g, 30);

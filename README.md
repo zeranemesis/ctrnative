@@ -71,6 +71,14 @@ choisit, un second lance), clavier (flèches, Entrée, Tab, Échap) ou manette.
 La page « Codes » (X, F2) coche les cheats du jeu choisi : elle lit
 `<cheats>/<id du jeu>.txt` et écrit les noms cochés dans `<id du jeu>.on`, que
 `tools/ctrn.py` passe à l'hôte ; rien n'est coché par défaut.
+Les réglages du menu passent au jeu les améliorations de l'image, toutes
+désactivées par défaut (le jeu tel qu'il est) : filtre, FXAA, accentuation,
+couleurs de l'écran 3DS, lignes de balayage, filtrage anisotrope, mipmaps, 3D,
+pack de textures (`%LOCALAPPDATA%\ctrnative	extures\<id du jeu>`). En jeu, **F1**
+ouvre un menu par-dessus l'image et met le jeu en pause : filtre, effets et 3D
+changent aussitôt, l'anisotropie et les mipmaps à la reprise (textures
+rechargées). Il demande le `pn_set_texture_options` de picanative (branche
+`menu`).
 
 ```bash
 cmake -S src/menu -B build-menu -G Ninja -DCMAKE_BUILD_TYPE=Release \
