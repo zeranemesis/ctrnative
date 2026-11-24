@@ -650,6 +650,7 @@ int main(int argc, char** argv) {
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
   host::profiler::report();
+  cheats.report();
   pn_print_stats(engine);
   if (std::getenv("CTRN_LOG_THREADS")) {
     auto lock = kernel.lock();
