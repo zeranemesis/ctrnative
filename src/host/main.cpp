@@ -361,6 +361,8 @@ int main(int argc, char** argv) {
     if (effects.find("lcd") != std::string::npos) mask |= PN_EFFECT_LCD_COLORS;
     if (effects.find("scanlines") != std::string::npos) mask |= PN_EFFECT_SCANLINES;
     pn_window_set_filter(window, filter == "nearest" ? 1 : filter == "sharp" ? 2 : 0, mask);
+    const std::string stereo = std::getenv("CTRN_STEREO") ? std::getenv("CTRN_STEREO") : "";
+    pn_window_set_stereo(window, stereo == "anaglyph" ? 1 : stereo == "sbs" ? 2 : 0);
   }
   // how the screens share the window: CTRN_LAYOUT stacked (the console's), side, large or top (F10 cycles them)
   if (const char* layout = std::getenv("CTRN_LAYOUT"); window && layout) {

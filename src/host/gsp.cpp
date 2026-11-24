@@ -73,6 +73,7 @@ std::array<pn_screen, 2> Gsp::screens() const {
     auto reg = [&](uint32_t r) { return registers_[(kLcd[s] + r) / 4]; };
     const bool b = reg(kSelect) & 1;
     out[s].address = force_black_ ? 0 : (b ? reg(kBLeft) : reg(kALeft));
+    out[s].right = force_black_ ? 0 : (b ? reg(kBRight) : reg(kARight));
     out[s].format = reg(kFormat);
     out[s].stride = reg(kStride);
   }

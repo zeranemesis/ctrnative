@@ -192,6 +192,12 @@ void Kernel::load(const Image& image) {
   std::memcpy(shared + 0x60, mac, 6);
   shared[0x66] = 3, shared[0x67] = 2;
   shared[0x85] = 0x15; // battery
+  // CTRN_STEREO (anaglyph or sbs): the 3D slider all the way up, so games draw the right eye (0x84 stays 0: set,
+  // NSMB2 takes a constant instead of the slider)
+  if (const char* stereo = std::getenv("CTRN_STEREO"); stereo && *stereo) {
+    const float up = 1.0f;
+    std::memcpy(shared + 0x80, &up, 4);
+  }
   // shortcut: the date and time slots (0x20, 0x40) stay 0; fill them from the host clock when a game reads them
 
   create_thread(image.text_address, 0x10000000, 0, image.priority); // the main thread: no handle, as Zakuro
