@@ -96,6 +96,9 @@ void Gsp::apply_framebuffer_updates() {
     registers_[(lcd + kFormat) / 4] = m.read32(entry + 0x10);
     registers_[(lcd + kSelect) / 4] = index & 1;
     m.write32(record, index); // picked up: the flag clears, as the real GSP does
+    // CTRN_LOG_SCREENS=1: each picture a screen is handed
+    static const bool log = std::getenv("CTRN_LOG_SCREENS") != nullptr;
+    if (log) std::printf("[gsp] screen %u: index %u, left %08x, format %x\n", s, index, left, m.read32(entry + 0x10));
   }
 }
 

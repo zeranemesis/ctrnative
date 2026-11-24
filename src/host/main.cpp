@@ -329,6 +329,11 @@ int main(int argc, char** argv) {
   const std::string translated = (std::filesystem::path(argv[1]).parent_path() / "shaders.pnvs").string();
   if (!pn_load_shaders(engine, translated.c_str(), message, sizeof message))
     std::printf("[host] no shaders translated ahead (%s: %s)\n", translated.c_str(), message);
+  // the GPU pipelines of the game's earlier runs, made again while it starts (CTRN_NO_WARM=1: not)
+  if (!std::getenv("CTRN_NO_WARM")) {
+    const std::string recipes = (std::filesystem::path(argv[1]).parent_path() / "pipelines.pnpl").string();
+    std::printf("[host] %u GPU pipelines of earlier runs made again ahead\n", pn_warm_pipelines(engine, recipes.c_str()));
+  }
   // the internal resolution: CTRN_SCALE times the console's (2 by default, 1 = the console's pixels)
   const char* scale_env = std::getenv("CTRN_SCALE");
   pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 2);
@@ -606,6 +611,7 @@ int main(int argc, char** argv) {
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
   host::profiler::report();
+  pn_print_stats(engine);
   if (std::getenv("CTRN_LOG_THREADS")) {
     auto lock = kernel.lock();
     kernel.print_threads();

@@ -785,6 +785,7 @@ bool Services::ldr_ro(Kernel& kernel, uint32_t* c) {
       }
     }
     const std::string& name = cro_->last().name;
+    std::printf("[host] ldr:ro: module %s loaded at %08x\n", name.c_str(), base);
     if (!module || !module->place(name, base)) {
       std::printf("[host] ldr:ro: %s loaded at %08x has no translated code: it cannot run\n", name.c_str(), base);
       // a module the RomFS has not as a .cro file (packed, unpacked by the game): saved as the game handed it, the
