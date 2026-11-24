@@ -1,3 +1,4 @@
+#include "profiler.hpp"
 #include "kernel.hpp"
 
 #include <algorithm>
@@ -40,6 +41,7 @@ void start_host_thread(void (*body)(void*), void* argument) {
       nullptr, kStack,
       [](void* p) -> unsigned {
         auto* s = static_cast<Start*>(p);
+        profiler::enroll("game");
         s->body(s->argument);
         delete s;
         return 0;
@@ -247,6 +249,27 @@ std::shared_ptr<Object> Kernel::resolve(uint32_t handle) {
   if (handle == 0xFFFF8001) return process_;
   const auto found = handles_.find(handle);
   return found == handles_.end() ? nullptr : found->second;
+}
+
+void Kernel::print_threads() {
+  static const char* states[] = {"ready", "running", "sleeping", "waiting", "arbiter", "dead"};
+  static const char* kinds[] = {"thread", "event", "mutex", "semaphore", "timer", "arbiter", "shared", "session", "port", "process", "limit"};
+  const auto at = now();
+  for (const auto& t : threads_) {
+    if (t->state == Thread::State::Dead) continue;
+    std::printf("[threads] id %u prio %d %s pc %08x lr %08x sp %08x", t->id, t->priority, states[static_cast<int>(t->state)],
+                t->ctx.r[15], t->ctx.r[14], t->ctx.r[13]);
+    if (t->wake_at != Clock::time_point::max())
+      std::printf(" wakes in %.3f ms", std::chrono::duration<double, std::milli>(t->wake_at - at).count());
+    for (const auto& o : t->waiting) {
+      std::printf(" %s%s", t->wait_all ? "&" : "|", kinds[static_cast<int>(o->kind)]);
+      if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port) std::printf(":%s", static_cast<const Session&>(*o).name.c_str());
+      if (o->kind == Object::Kind::Event) std::printf("(%s)", static_cast<const Event&>(*o).signaled ? "set" : "unset");
+      if (o->kind == Object::Kind::Mutex) std::printf("(owner %u)", static_cast<const Mutex&>(*o).owner ? static_cast<const Mutex&>(*o).owner->id : 0);
+    }
+    std::printf("\n");
+  }
+  std::fflush(stdout);
 }
 
 void Kernel::stop(const std::string& why) {

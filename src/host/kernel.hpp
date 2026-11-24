@@ -144,6 +144,7 @@ public:
   void wake();
   std::unique_lock<std::mutex> lock() { return std::unique_lock<std::mutex>(mutex_); }
   void stop(const std::string& why);   // ends the run with this reason
+  void print_threads();                 // each thread's state and what it waits for (the lock held)
   Memory& memory() { return memory_; }
   uint64_t ticks() const;
   // CTRN_FIXED_STEP: the game's time is virtual (set before start); the host moves it to `ns` (from the start) and

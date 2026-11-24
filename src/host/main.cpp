@@ -2,6 +2,7 @@
 // drawn by picanative in its SDL3 window, no emulator.
 // usage: ctrnative <module> <rom.3ds>  (or <module> <code.bin> <exheader.bin>)
 // CTRN_HEADLESS=1: no window; CTRN_FRAMES=n: stop after n frames.
+#include "profiler.hpp"
 #include "dsp.hpp"
 #include "gfx_native.hpp"
 #include "gsp.hpp"
@@ -104,6 +105,8 @@ LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
         std::fprintf(stderr, "[host] stack +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", n, w[0], w[1], w[2], w[3],
                      w[4], w[5], w[6], w[7]);
       }
+      std::fflush(stderr);
+      g_crash_kernel->print_threads(); // without the lock: a crash report, a torn line at worst
     }
   HMODULE module = nullptr;
   char name[MAX_PATH] = "?";
@@ -414,7 +417,10 @@ int main(int argc, char** argv) {
         }
   };
   const uint64_t audio_ns = 160ull * 1000000000ull / 32728;
+  host::profiler::enroll("main");
+  host::profiler::start(module);
   std::thread audio([&] {
+    host::profiler::enroll("audio");
     if (fixed_step) return; // the main loop runs the blocks at their virtual times
     const auto audio_period = std::chrono::nanoseconds(audio_ns);
     auto due = std::chrono::steady_clock::now() + audio_period;
@@ -599,6 +605,11 @@ int main(int argc, char** argv) {
   double times[7];
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
+  host::profiler::report();
+  if (std::getenv("CTRN_LOG_THREADS")) {
+    auto lock = kernel.lock();
+    kernel.print_threads();
+  }
 #if defined(_WIN32)
   if (g_guard.faults) std::printf("[host] the game wrote over %llu pending drawings: written first\n", static_cast<unsigned long long>(g_guard.faults));
 #endif

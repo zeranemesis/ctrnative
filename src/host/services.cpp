@@ -569,7 +569,11 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
       block->size = std::max<uint32_t>((size + 0xFFF) & ~0xFFFu, 0x1000);
       block->physical = kernel.allocate(Kernel::kBase, block->size, false);
       if (block->physical) std::memset(kernel.memory().physical(block->physical, block->size), 0, block->size);
-      post_parameter(kernel, {destination, 3, {}, block->physical ? kernel.add_handle(block) : 0});
+      // the Response's buffer is the memory's size: the title maps that much (none: a mapping of 0 bytes fails and
+      // Majora's Mask then captured its screen to address 0)
+      std::vector<uint8_t> told(4);
+      std::memcpy(told.data(), &block->size, 4);
+      post_parameter(kernel, {destination, 3, std::move(told), block->physical ? kernel.add_handle(block) : 0});
     }
     reply(c, command);
     return true;
@@ -603,7 +607,11 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     const uint32_t size = std::min({static_cast<uint32_t>(parameter_.buffer.size()), c[2], capacity});
     if (size) kernel.memory().write(address, parameter_.buffer.data(), size);
     c[0] = header(command, 4, 4), c[1] = kOk, c[2] = parameter_.sender, c[3] = parameter_.signal, c[4] = size;
-    c[5] = 0x10, c[6] = parameter_.handle, c[7] = static_descriptor(size, 0), c[8] = address;
+    // the handle is moved to the title: a new one at each glance or receive (it may close one before the next)
+    uint32_t handed = 0;
+    if (parameter_.handle)
+      if (auto object = kernel.resolve(parameter_.handle)) handed = kernel.add_handle(object);
+    c[5] = 0x10, c[6] = handed, c[7] = static_descriptor(size, 0), c[8] = address;
     if (command == 0x000D) has_parameter_ = false;
     return true;
   }
