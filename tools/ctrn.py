@@ -868,6 +868,15 @@ def main():
 
     exheader, code = read_code(rom)
     text_start, text_pages = struct.unpack_from("<II", exheader, 0x10)
+    # a variant of the game (a mod's code, cheats patching it) starts from what the game's own cache learned
+    # (function starts, unpacked modules): the same code but for a few words, no learning all over again
+    base_game = args.cache / "games" / f"{title_id:016X}-{digest[:12]}"
+    if game != base_game and not game.exists() and base_game.is_dir():
+        game.mkdir(parents=True)
+        if (base_game / "hints.txt").is_file():
+            shutil.copy2(base_game / "hints.txt", game / "hints.txt")
+        if (base_game / "modules").is_dir():
+            shutil.copytree(base_game / "modules", game / "modules")
     game.mkdir(parents=True, exist_ok=True)
     # the mod's code: its IPS patch over the game's (decompressed, as Luma patches it); its RomFS: the game's with
     # the mod's files in place, built once into the cache
@@ -983,7 +992,14 @@ def main():
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:
     # that address becomes a hint, the module is rebuilt (only what changed) and the game starts again
     for attempt in range(80):  # each new hint or module costs a rebuild and a fresh start
-        run = subprocess.Popen([str(args.host), str(module), str(rom)], env=env, stdout=subprocess.PIPE,
+        # the code patched (a mod's code.ips, cheats that patch it): the host runs that code, with the ROM's
+        # exheader and RomFS (CTRN_ROM)
+        game_args = [str(rom)]
+        if (code_mod or cheat_writes) and (game / "mod-code.bin").is_file():
+            (game / "exheader.bin").write_bytes(exheader)
+            env["CTRN_ROM"] = str(rom)
+            game_args = [str(game / "mod-code.bin"), str(game / "exheader.bin")]
+        run = subprocess.Popen([str(args.host), str(module), *game_args], env=env, stdout=subprocess.PIPE,
                                text=True, errors="replace")
         missing = None
         saved = None
