@@ -30,6 +30,8 @@ const Row kRows[] = {
    L"Moins de scintillement des textures au loin. Appliqué à la reprise : les textures sont rechargées."},
   {L"3D", 3, {L"Désactivé", L"Anaglyphe", L"Côte à côte"},
    L"L'écran du haut en relief, quand le jeu dessine les deux yeux : lunettes rouge et cyan, ou télévision 3D."},
+  {L"Échelle de rendu", 4, {L"1×", L"2×", L"3×", L"4×"},
+   L"La résolution interne du rendu (1× : les pixels de la console). Appliquée à la reprise, après un court rechargement."},
 };
 constexpr int kCount = sizeof kRows / sizeof kRows[0];
 constexpr int kAniso[5] = {0, 2, 4, 8, 16};
@@ -38,14 +40,15 @@ int get(const Look& l, int row) {
   if (row == 0) return l.filter;
   if (row <= 4) return l.effects >> (row - 1) & 1; // PN_EFFECT_FXAA, SHARPEN, LCD_COLORS, SCANLINES: bits 0-3
   if (row == 5) return int(std::find(kAniso, kAniso + 5, l.anisotropy) - kAniso) % 5;
-  return row == 6 ? l.mipmaps : l.stereo;
+  return row == 6 ? l.mipmaps : row == 7 ? l.stereo : l.scale - 1;
 }
 void set(Look& l, int row, int v) {
   if (row == 0) l.filter = v;
   else if (row <= 4) l.effects = (l.effects & ~(1 << (row - 1))) | v << (row - 1);
   else if (row == 5) l.anisotropy = kAniso[v];
   else if (row == 6) l.mipmaps = v;
-  else l.stereo = v;
+  else if (row == 7) l.stereo = v;
+  else l.scale = v + 1;
 }
 
 struct State {
@@ -107,7 +110,7 @@ void paint(HWND w, HDC out) {
   const int m = int(10 * u);
   say(title, RGB(240, 243, 246), px + m, py + int(6 * u), px + pw - m, py + int(26 * u), L"Réglages  ·  jeu en pause",
       DT_SINGLELINE | DT_VCENTER);
-  g.row_top = py + 30 * u, g.row_h = 18 * u;
+  g.row_top = py + 30 * u, g.row_h = 17 * u;
   for (int i = 0; i < kCount; ++i) {
     const int y = int(g.row_top + i * g.row_h), h = int(g.row_h) - 1;
     const bool on = i == g.selected;

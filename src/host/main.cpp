@@ -368,12 +368,14 @@ int main(int argc, char** argv) {
     for (int n : {2, 4, 8, 16}) // the menu's steps
       if (anisotropy >= n) settings_look.anisotropy = n;
     settings_look.mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
+    settings_look.scale = std::clamp(scale_env ? std::atoi(scale_env) : 1, 1, 4);
   }
   const auto apply_look = [&](const host::Look& l) {
     for (pn_window* target : {window, look})
       if (target) pn_window_set_filter(target, static_cast<uint32_t>(l.filter), static_cast<uint32_t>(l.effects)),
                   pn_window_set_stereo(target, l.stereo);
     pn_set_texture_options(engine, l.anisotropy, l.mipmaps);
+    pn_set_resolution_scale(engine, static_cast<uint32_t>(l.scale)); // during a game: a short reload
   };
   apply_look(settings_look);
   // how the screens share the window: CTRN_LAYOUT stacked (the console's), side, large or top (F10 cycles them)

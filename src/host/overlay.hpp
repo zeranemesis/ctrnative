@@ -11,6 +11,7 @@ struct Look {
   int anisotropy = 0; // 0 off, else samples
   int mipmaps = 0;
   int stereo = 0;     // pn_window_set_stereo
+  int scale = 1;      // pn_set_resolution_scale, 1 to 4
 };
 
 // true when F1 was just pressed over the game's window (Windows; false elsewhere)
