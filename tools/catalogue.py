@@ -5,13 +5,17 @@ columns are added to the table the first time, with a count at the top."""
 import argparse
 import copy
 import datetime
+import shutil
 from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.worksheet.table import TableColumn
 
 HERE = Path(__file__).resolve().parent
-DEFAULT = HERE.parent / "docs" / "Catalogue Nintendo 3DS.xlsx"
+REPO_COPY = HERE.parent / "docs" / "Catalogue Nintendo 3DS.xlsx"
+# the user's catalogue lives next to the ROMs; the repo keeps a copy of it
+SHARED = Path(r"C:\jeu 3ds\Catalogue Nintendo 3DS.xlsx")
+DEFAULT = SHARED if SHARED.is_file() else REPO_COPY
 COLUMNS = [("Testé (ctrnative)", 14), ("Fonctionnel", 14), ("Images/s", 11), ("Ce qui est testé", 60),
            ("Date du test", 14), ("Remarques", 70)]
 NAME_COLUMN = "Nom de l’édition"
@@ -73,6 +77,8 @@ def mark(path, rom, works, fps=None, scope=None, notes=None, date=None):
     if notes is not None:
         ws.cell(r, start + 5, notes)
     wb.save(path)
+    if Path(path).resolve() != REPO_COPY.resolve():
+        shutil.copy(path, REPO_COPY)
     print(f"{edition}: line {r}, {works}")
 
 
