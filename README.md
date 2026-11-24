@@ -68,7 +68,7 @@ code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 |---|---|
 | `CTRN_USER_DIR` | le dossier des sauvegardes |
 | `CTRN_HEADLESS=1`, `CTRN_FRAMES=n` | sans fenêtre, arrêt après n images |
-| `CTRN_SCALE` | résolution interne (2 par défaut) |
+| `CTRN_SCALE` | résolution interne, 1 à 4 (1 par défaut : les pixels de la console) |
 | `CTRN_LAYOUT` | `stacked`, `side`, `large` ou `top` (F10 change) |
 | `CTRN_SHOT_EVERY=n`, `CTRN_SHOT_DIR` | les deux écrans toutes les n images (`f*.ppm`, `b*.ppm`) |
 | `CTRN_PRESS_A=1`, `CTRN_TAP_AT=x,y` | essais sans joueur : A, ou un toucher, 6 images sur 60 |
