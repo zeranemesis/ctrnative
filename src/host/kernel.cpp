@@ -2,8 +2,12 @@
 #include "kernel.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -198,7 +202,22 @@ void Kernel::load(const Image& image) {
     const float up = 1.0f;
     std::memcpy(shared + 0x80, &up, 4);
   }
-  // shortcut: the date and time slots (0x20, 0x40) stay 0; fill them from the host clock when a game reads them
+  // the date and time (slot 0 at 0x20, the selector at 0 says which): the host's local time in ms since 1900 at tick 0,
+  // the kernel's start, which games move on by GetSystemTick. A fixed-step run keeps 0, to replay alike
+  if (!std::getenv("CTRN_FIXED_STEP")) {
+    const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now() -
+                                                                  std::chrono::duration_cast<std::chrono::system_clock::duration>(Clock::now() - start_));
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &now);
+    const int64_t seconds = _mkgmtime(&local); // the local time read as UTC: local seconds since 1970
+#else
+    localtime_r(&now, &local);
+    const int64_t seconds = timegm(&local);
+#endif
+    const uint64_t slot[4] = {static_cast<uint64_t>(seconds + 2208988800ll) * 1000, 0, kTicksPerSecond, 0};
+    std::memcpy(shared + 0x20, slot, sizeof slot);
+  }
 
   create_thread(image.text_address, 0x10000000, 0, image.priority); // the main thread: no handle, as Zakuro
 }
@@ -634,7 +653,62 @@ void Kernel::signal(Event& event) {
   wake_timekeeper_.notify_one();
 }
 
+// CTRN_WAIT_STATS=seconds: each millisecond, every game thread's state and what it waits for (the objects, the call
+// site), a share of the time per thread each period: where a game that draws slowly while the host idles waits
+void Kernel::sample_waits(double period) {
+  static const char* kinds[] = {"thread", "event", "mutex", "semaphore", "timer", "arbiter", "shared", "session", "port", "process", "limit"};
+  std::map<std::string, uint64_t> counts;
+  uint64_t samples = 0;
+  auto report_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(period));
+  while (!stopped_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+      auto lock = this->lock();
+      for (const auto& t : threads_) {
+        if (t->state == Thread::State::Dead) continue;
+        char head[64];
+        std::snprintf(head, sizeof head, "thread %2u prio %2d ", t->id, t->priority);
+        std::string key = head;
+        switch (t->state) {
+        case Thread::State::Running: key += "running"; break;
+        case Thread::State::Ready: key += "ready (waits for the core)"; break;
+        case Thread::State::Sleeping: key += "sleeping"; break;
+        case Thread::State::WaitArbiter: key += "arbiter"; break;
+        case Thread::State::WaitSync:
+          key += "waits";
+          for (const auto& o : t->waiting) {
+            key += std::string(" ") + (t->wait_all ? "&" : "|") + kinds[static_cast<int>(o->kind)];
+            if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port)
+              key += ":" + static_cast<const Session&>(*o).name;
+          }
+          break;
+        default: break;
+        }
+        if (t->state != Thread::State::Running && t->state != Thread::State::Ready) {
+          char site[24];
+          std::snprintf(site, sizeof site, " from %08x", t->ctx.r[14]);
+          key += site;
+        }
+        ++counts[key];
+      }
+      ++samples;
+    }
+    if (Clock::now() < report_at) continue;
+    std::vector<std::pair<uint64_t, std::string>> lines;
+    for (auto& [k, n] : counts) lines.emplace_back(n, k);
+    std::sort(lines.begin(), lines.end(), [](auto& a, auto& b) { return a.second < b.second || (a.second == b.second && a.first > b.first); });
+    std::printf("[waits] %llu samples:\n", static_cast<unsigned long long>(samples));
+    for (auto& [n, k] : lines)
+      if (n * 100 >= samples) std::printf("[waits]   %5.1f %%  %s\n", 100.0 * n / samples, k.c_str());
+    std::fflush(stdout);
+    counts.clear(), samples = 0;
+    report_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(period));
+  }
+}
+
 void Kernel::start() {
+  if (const char* e = std::getenv("CTRN_WAIT_STATS"))
+    std::thread([this, period = std::max(1.0, std::atof(e))] { sample_waits(period); }).detach();
   keeper_ = std::thread([this] { timekeeper(); });
   auto lock = this->lock();
   pass();

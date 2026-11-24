@@ -12,6 +12,7 @@ The game's saves go to CTRN_USER_DIR (default: <cache>/user)."""
 import argparse, hashlib, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
+import cheats  # cheats that patch the code (tools/cheats.py)
 import romfs  # a mod's RomFS (tools/romfs.py)
 
 HERE = Path(__file__).resolve().parent
@@ -801,10 +802,37 @@ def main():
                          str(p.stat().st_mtime_ns).encode())
         mod_digest = h.hexdigest()[:8]
         print(f"[ctrn] mod {mod_dir} ({mod_digest})", flush=True)
+    # the cheats on (the codes named in <cheats>/<title ID>.on, or CTRN_CHEATS_ON): what they write into the code
+    # without a condition is patched in before translation (the code runs translated: written as the game runs,
+    # it would change nothing); their writes to data the host makes each frame
+    cheats_dir = Path(os.environ.get("CTRN_CHEATS_DIR") or default_cache() / "cheats")
+    cheats_file = next((p for p in cheats_dir.glob(f"{title_id:016X}.*") if p.suffix.lower() == ".txt"), None)
+    on_file = cheats_dir / f"{title_id:016X}.on"
+    cheats_on = [n for n in os.environ.get("CTRN_CHEATS_ON", "").split(";") if n.strip()]
+    if not cheats_on and on_file.is_file():
+        cheats_on = [l.strip() for l in on_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    cheat_writes, cheat_digest = [], ""
+    if cheats_file and cheats_on:
+        exheader0, _ = read_code(rom)
+        code_start = struct.unpack_from("<I", exheader0, 0x10)[0]
+        ro_address, ro_pages = struct.unpack_from("<II", exheader0, 0x20)
+        all_codes = cheats.parse(cheats_file.read_text(encoding="utf-8", errors="replace"))
+        for name, lines in all_codes.items():
+            if "*" not in cheats_on and name not in cheats_on:
+                continue
+            writes, uncertain = cheats.code_writes(lines, code_start, ro_address + ro_pages * 0x1000)
+            cheat_writes += writes
+            if uncertain:
+                print(f"[ctrn] cheat {name!r}: its writes into the code depend on a condition (a key, memory): those "
+                      f"cannot be patched ahead, they do nothing", flush=True)
+        if cheat_writes:
+            cheat_digest = hashlib.sha256(repr(cheat_writes).encode()).hexdigest()[:8]
+            print(f"[ctrn] cheats patch the code in {len(cheat_writes)} places ({cheat_digest})", flush=True)
     # a mod that changes code (code.ips, modules) has a cache of its own; one of data files shares the game's
     code_mod = bool(mod_dir) and ((mod_dir / "code.ips").is_file() or any(
         p.suffix.lower() in (".cro", ".crs", ".crr") for p in (mod_dir / "romfs").rglob("*")))
-    game = args.cache / "games" / (f"{title_id:016X}-{digest[:12]}" + (f"-mod{mod_digest}" if code_mod else ""))
+    game = args.cache / "games" / (f"{title_id:016X}-{digest[:12]}" + (f"-mod{mod_digest}" if code_mod else "") +
+                                   (f"-asm{cheat_digest}" if cheat_writes else ""))
     module = game / ("module.dll" if os.name == "nt" else "module.so")
 
     hints = game / "hints.txt"  # function starts 3dsrecomp cannot find, one address a line
@@ -826,7 +854,7 @@ def main():
         # modules the game loaded that its RomFS has not as files (saved by the host when it met them)
         modules = ["--modules", str(modules_dir)] if any(modules_dir.glob("*.cro")) else []
         mod_args = []
-        if code_mod and (game / "mod-code.bin").is_file():
+        if (code_mod or cheat_writes) and (game / "mod-code.bin").is_file():
             mod_args += ["--code", str(game / "mod-code.bin")]
         if code_mod and (mod_dir / "romfs").is_dir():
             mod_args += ["--romfs-dir", str(mod_dir / "romfs")]
@@ -840,11 +868,23 @@ def main():
 
     exheader, code = read_code(rom)
     text_start, text_pages = struct.unpack_from("<II", exheader, 0x10)
+    # a variant of the game (a mod's code, cheats patching it) starts from what the game's own cache learned
+    # (function starts, unpacked modules): the same code but for a few words, no learning all over again
+    base_game = args.cache / "games" / f"{title_id:016X}-{digest[:12]}"
+    if game != base_game and not game.exists() and base_game.is_dir():
+        game.mkdir(parents=True)
+        if (base_game / "hints.txt").is_file():
+            shutil.copy2(base_game / "hints.txt", game / "hints.txt")
+        if (base_game / "modules").is_dir():
+            shutil.copytree(base_game / "modules", game / "modules")
     game.mkdir(parents=True, exist_ok=True)
     # the mod's code: its IPS patch over the game's (decompressed, as Luma patches it); its RomFS: the game's with
     # the mod's files in place, built once into the cache
     if mod_dir and (mod_dir / "code.ips").is_file():
         code = romfs.apply_ips(code, (mod_dir / "code.ips").read_bytes())
+    if cheat_writes:
+        code = cheats.patch(code, text_start, cheat_writes)
+    if (mod_dir and (mod_dir / "code.ips").is_file()) or cheat_writes:
         (game / "mod-code.bin").write_bytes(code)
     mod_romfs = game / f"romfs-{mod_digest}.bin"
     if mod_dir and (mod_dir / "romfs").is_dir() and not mod_romfs.is_file():
@@ -943,19 +983,23 @@ def main():
     # cheats, as Luma3DS has them: <cheats>/<title ID>.txt (Action Replay codes under [names]), <cheats> being
     # CTRN_CHEATS_DIR or %LOCALAPPDATA%/ctrnative/cheats; the codes on are the names in <title ID>.on, one a line
     # (or CTRN_CHEATS_ON=name;name); none by default
-    cheats_dir = Path(os.environ.get("CTRN_CHEATS_DIR") or default_cache() / "cheats")
-    cheats_file = cheats_dir / f"{title_id:016X}.txt"
-    if "CTRN_CHEATS" not in env and cheats_file.is_file():
+    if "CTRN_CHEATS" not in env and cheats_file:
         env["CTRN_CHEATS"] = str(cheats_file)
-        on_file = cheats_dir / f"{title_id:016X}.on"
-        if "CTRN_CHEATS_ON" not in env and on_file.is_file():
-            env["CTRN_CHEATS_ON"] = ";".join(l.strip() for l in on_file.read_text(encoding="utf-8").splitlines() if l.strip())
+        if "CTRN_CHEATS_ON" not in env and cheats_on:
+            env["CTRN_CHEATS_ON"] = ";".join(cheats_on)
     if mod_dir and mod_romfs.is_file():
         env["CTRN_ROMFS"] = str(mod_romfs)  # the host serves it in place of the ROM's
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:
     # that address becomes a hint, the module is rebuilt (only what changed) and the game starts again
     for attempt in range(80):  # each new hint or module costs a rebuild and a fresh start
-        run = subprocess.Popen([str(args.host), str(module), str(rom)], env=env, stdout=subprocess.PIPE,
+        # the code patched (a mod's code.ips, cheats that patch it): the host runs that code, with the ROM's
+        # exheader and RomFS (CTRN_ROM)
+        game_args = [str(rom)]
+        if (code_mod or cheat_writes) and (game / "mod-code.bin").is_file():
+            (game / "exheader.bin").write_bytes(exheader)
+            env["CTRN_ROM"] = str(rom)
+            game_args = [str(game / "mod-code.bin"), str(game / "exheader.bin")]
+        run = subprocess.Popen([str(args.host), str(module), *game_args], env=env, stdout=subprocess.PIPE,
                                text=True, errors="replace")
         missing = None
         saved = None

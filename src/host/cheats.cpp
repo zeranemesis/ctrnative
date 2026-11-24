@@ -11,6 +11,32 @@
 namespace host {
 
 namespace {
+// a variable as UTF-8 (Windows hands getenv the ANSI code page: an accented name would not match the file's)
+std::string environment(const char* name) {
+#if defined(_WIN32)
+  wchar_t wide_name[64] = {};
+  for (size_t i = 0; name[i] && i < 63; ++i) wide_name[i] = static_cast<wchar_t>(name[i]);
+  const wchar_t* value = _wgetenv(wide_name);
+  if (!value) return {};
+  std::string out;
+  for (const wchar_t* p = value; *p; ++p) { // UTF-16 to UTF-8, pairs included
+    uint32_t c = *p;
+    if (c >= 0xD800 && c < 0xDC00 && p[1] >= 0xDC00 && p[1] < 0xE000) c = 0x10000 + ((c - 0xD800) << 10) + (*++p - 0xDC00);
+    if (c < 0x80) out += static_cast<char>(c);
+    else if (c < 0x800) out += static_cast<char>(0xC0 | c >> 6), out += static_cast<char>(0x80 | (c & 0x3F));
+    else if (c < 0x10000)
+      out += static_cast<char>(0xE0 | c >> 12), out += static_cast<char>(0x80 | (c >> 6 & 0x3F)), out += static_cast<char>(0x80 | (c & 0x3F));
+    else
+      out += static_cast<char>(0xF0 | c >> 18), out += static_cast<char>(0x80 | (c >> 12 & 0x3F)),
+          out += static_cast<char>(0x80 | (c >> 6 & 0x3F)), out += static_cast<char>(0x80 | (c & 0x3F));
+  }
+  return out;
+#else
+  const char* value = std::getenv(name);
+  return value ? value : "";
+#endif
+}
+
 std::string trimmed(std::string s) {
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
   size_t i = 0;
@@ -28,7 +54,7 @@ Cheats::Cheats() {
     return;
   }
   std::set<std::string> on;
-  if (const char* names = std::getenv("CTRN_CHEATS_ON"))
+  if (const std::string names = environment("CTRN_CHEATS_ON"); !names.empty())
     for (std::stringstream list(names); list.good();) {
       std::string name;
       std::getline(list, name, ';');
@@ -56,6 +82,17 @@ std::vector<std::pair<std::string, bool>> Cheats::list() const {
   return out;
 }
 
+void Cheats::report() const {
+  if (!std::getenv("CTRN_CHEATS_REPORT")) return;
+  for (const Code& c : codes_)
+    if (c.on)
+      std::printf("[cheats] %s: %llu writes, %llu to unmapped memory, %llu into the code; conditions held %llu, failed %llu\n",
+                  c.name.c_str(), static_cast<unsigned long long>(c.written), static_cast<unsigned long long>(c.unmapped),
+                  static_cast<unsigned long long>(c.into_code), static_cast<unsigned long long>(c.held),
+                  static_cast<unsigned long long>(c.failed));
+  std::fflush(stdout);
+}
+
 void Cheats::run(Memory& memory, uint32_t keys) const {
   for (const Code& c : codes_)
     if (c.on) run(c, memory, keys);
@@ -74,7 +111,18 @@ void Cheats::run(const Code& code, Memory& memory, uint32_t keys) const {
       if (const uint8_t* b = memory.host(address + k)) value |= uint32_t{*b} << (8 * k);
     return value;
   };
+  // a write: to data (the game's writable memory), into its code (read-only: the code runs translated, a code
+  // patching it changes nothing), or nowhere (unmapped)
   auto write = [&](uint32_t address, uint32_t value, uint32_t size) {
+    if (!memory.host(address)) {
+      ++code.unmapped;
+      return;
+    }
+    if (!memory.write_pages()[address >> 12]) {
+      ++code.into_code;
+      return;
+    }
+    ++code.written;
     for (uint32_t k = 0; k < size; ++k)
       if (memory.host(address + k)) memory.write(address + k, reinterpret_cast<const uint8_t*>(&value) + k, 1);
   };
@@ -88,6 +136,7 @@ void Cheats::run(const Code& code, Memory& memory, uint32_t keys) const {
       else if ((a >> 24) == 0xD2) skip = 0, offset = data = 0, looping = false;
       continue;
     }
+    const bool condition = (type >= 3 && type <= 0xA) || (a >> 24) == 0xDD;
     switch (type) {
     case 0x0: write(at, b, 4); break;
     case 0x1: write(at, b & 0xFFFF, 2); break;
@@ -146,6 +195,7 @@ void Cheats::run(const Code& code, Memory& memory, uint32_t keys) const {
       break;
     default: break;
     }
+    if (condition) ++(skip ? code.failed : code.held);
   }
 }
 
