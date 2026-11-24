@@ -471,11 +471,11 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       reply(c, command);
       return true;
     }
-    case 0x0851: { // CreateExtSaveData(media, _, id low, id high, _, directories, files, size x2, icon size, <icon>)
+    case 0x0851: { // CreateExtSaveData(media, id low, id high, _, directories, files, size x2, icon size, <icon>)
       const std::filesystem::path root = extdata_root(false, c[2] | uint64_t{c[3]} << 32);
       std::error_code ignored;
       std::filesystem::create_directories(root, ignored);
-      const uint32_t info[4] = {0, c[6], c[7], 0};
+      const uint32_t info[4] = {0, c[5], c[6], 0}; // the info is 4 words: media, the 64-bit id, one unknown
       std::ofstream(root.string() + ".format", std::ios::binary).write(reinterpret_cast<const char*>(info), sizeof info);
       reply(c, command);
       return true;
