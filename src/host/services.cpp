@@ -145,6 +145,29 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
     default: return false;
     }
   }
+  // the amiibo reader, as a New 3DS's built-in one with nothing on it: ready at once, scanning finds no tag
+  if (service == "nfc:u") {
+    switch (command) {
+    case 0x0001: nfc_state_ = 1; reply(c, command); return true; // Initialize
+    case 0x0002: nfc_state_ = 0; reply(c, command); return true; // Shutdown
+    case 0x0005: nfc_state_ = 2; reply(c, command); return true; // StartTagScanning
+    case 0x0006: case 0x0008:                                    // StopTagScanning, ResetTagScanState
+      nfc_state_ = nfc_state_ ? 1 : 0;
+      reply(c, command);
+      return true;
+    case 0x0003: case 0x0004: reply(c, command); return true; // StartCommunication, StopCommunication
+    case 0x000B: case 0x000C: { // GetTagInRangeEvent, GetTagOutOfRangeEvent
+      auto& event = nfc_events_[command - 0x000B];
+      if (!event) event = std::make_shared<Event>();
+      c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0, c[3] = kernel.add_handle(event);
+      return true;
+    }
+    case 0x000D: reply(c, command, {nfc_state_}); return true; // GetTagState
+    case 0x000F: reply(c, command, {2}); return true;          // CommunicationGetStatus: connected
+    case 0x0012: reply(c, command, {0}); return true;          // CommunicationGetResult: no error
+    default: return false;
+    }
+  }
   if (service == "srv:") {
     switch (command) {
     case 0x0001: reply(c, command); return true; // RegisterClient

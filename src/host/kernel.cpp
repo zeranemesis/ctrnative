@@ -635,6 +635,13 @@ void Kernel::svc(Thread& self, uint32_t number) {
     if (!taken) r[12] = 0;
     return;
   }
+  if (number == 0xF1) { // CTRN_TRACE_FUNCS (ctrn.py): a traced function returned; r15 is it, r3 its result, r4 its caller
+    static const bool all = std::getenv("CTRN_TRACE_ALL") != nullptr;
+    if (all || r[3] == 0)
+      std::printf("[trace] %08x(%08x, %08x, %08x) -> %08x, from %08x\n", r[15], r[0], r[1], r[2], r[3], r[4]),
+          std::fflush(stdout); // a crash may follow
+    return;
+  }
   auto lock = this->lock();
   ++svc_sites_[{number, r[14]}];
   // the game's time moves on as it works; the host's natives (0xF0) cost it nothing: with or without them, the same run

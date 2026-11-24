@@ -44,6 +44,24 @@ TestInput::TestInput() {
         s.touch_x = static_cast<uint16_t>(tx), s.touch_y = static_cast<uint16_t>(ty);
         continue;
       }
+      if (w.rfind("w32=", 0) == 0 || w.rfind("w8=", 0) == 0) {
+        Step::Write wr;
+        wr.size = w[1] == '8' ? 1 : 4;
+        const char* p = w.c_str() + w.find('=') + 1;
+        char* end;
+        if ((wr.indirect = *p == '*')) {
+          wr.pointer = static_cast<uint32_t>(std::strtoul(p + 1, &end, 16));
+          p = *end == '+' ? end + 1 : end;
+        }
+        wr.address = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+        if (*end != ':') {
+          std::fprintf(stderr, "[input] a write without :VALUE: %s\n", w.c_str());
+          continue;
+        }
+        wr.value = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
+        s.writes.push_back(wr);
+        continue;
+      }
       bool known = false;
       for (const auto& n : names)
         if (w == n.name) s.buttons |= n.bit, known = true;
@@ -63,6 +81,20 @@ void TestInput::apply(uint64_t frame, Services::Input& input) const {
       input.buttons |= s.buttons, input.circle_x += s.x, input.circle_y += s.y;
       if (s.touch) input.touching = true, input.touch_x = s.touch_x, input.touch_y = s.touch_y;
     }
+}
+
+void TestInput::write(uint64_t frame, Memory& memory) const {
+  for (const Step& s : script_)
+    if (frame >= s.from && frame < s.to)
+      for (const Step::Write& w : s.writes) {
+        uint32_t address = w.address;
+        if (w.indirect) {
+          const uint32_t base = memory.read32(w.pointer);
+          if (!base) continue; // not made yet
+          address += base;
+        }
+        memory.write(address, &w.value, w.size); // little-endian host: the low byte for w8
+      }
 }
 
 } // namespace host

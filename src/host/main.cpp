@@ -84,12 +84,27 @@ void save_screen(pn_engine* engine, host::Memory& memory, const pn_screen& s, co
 // a crash nothing else caught (a decompiled function run without the check):
 // the faulting module and offset, for llvm-objdump on that DLL
 const host::Module* g_crash_module = nullptr; // to name the guest function a crash is in
+host::Kernel* g_crash_kernel = nullptr;        // to show the guest thread's registers and stack
 
 LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
   void* pc = e->ExceptionRecord->ExceptionAddress;
   if (g_crash_module)
     if (const uint32_t guest = g_crash_module->guest_function(pc))
       std::fprintf(stderr, "[host] crash in the guest function %08x\n", guest);
+  // the guest thread's registers as its context holds them (the translated code may keep newer ones in its own),
+  // and the top of its stack
+  if (g_crash_kernel)
+    if (auto t = g_crash_kernel->current()) {
+      const uint32_t* r = t->ctx.r;
+      for (int i = 0; i < 16; ++i)
+        std::fprintf(stderr, "%sr%d=%08x%s", i % 8 ? " " : "[host] ", i, r[i], i % 8 == 7 ? "\n" : "");
+      for (uint32_t n = 0; n < 0x700; n += 32) {
+        uint32_t w[8] = {};
+        g_crash_kernel->memory().read((r[13] & ~3u) + n, w, sizeof w);
+        std::fprintf(stderr, "[host] stack +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", n, w[0], w[1], w[2], w[3],
+                     w[4], w[5], w[6], w[7]);
+      }
+    }
   HMODULE module = nullptr;
   char name[MAX_PATH] = "?";
   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -101,6 +116,64 @@ LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
                e->ExceptionRecord->NumberParameters > 1 ? static_cast<unsigned long long>(e->ExceptionRecord->ExceptionInformation[1]) : 0ull);
   std::fflush(stderr);
   return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The console's GPU writes its pictures into memory as it draws; picanative keeps them on the host's GPU and
+// writes them when the range is read. Where that is the linear heap, the game may meanwhile reuse the memory
+// (a render target freed, its bytes given to other data) and the late write would wipe what it put there. So
+// pages with a drawing pending are read-only in the game's view; its first write there has the drawing written
+// first (pn_cpu_wrote), as on the console, then goes on. CTRN_NO_GUARD=1 turns it off.
+struct Guard {
+  static constexpr uint32_t kLinear = 0x14000000, kPages = host::Memory::kFcramSize >> 12;
+  host::Kernel* kernel = nullptr;
+  host::Memory* memory = nullptr;
+  pn_engine* engine = nullptr;
+  std::vector<uint16_t> count = std::vector<uint16_t>(kPages); // pending ranges over each linear page
+  uint64_t faults = 0;
+} g_guard;
+
+void guard_protect(uint32_t page, bool guarded) { // page: of the linear heap
+  DWORD old;
+  VirtualProtect(g_guard.memory->fastmem() + g_guard.kLinear + (uint64_t{page} << 12), 0x1000,
+                 guarded ? PAGE_READONLY : PAGE_READWRITE, &old);
+}
+
+// picanative's pending ranges (physical), under the kernel's lock
+void guard_pending(void*, uint32_t address, uint32_t size, int pending) {
+  if (address < host::Memory::kFcram || address >= host::Memory::kFcram + host::Memory::kFcramSize || !size) return;
+  const uint32_t first = (address - host::Memory::kFcram) >> 12;
+  const uint32_t last = std::min((address - host::Memory::kFcram + size - 1) >> 12, g_guard.kPages - 1);
+  for (uint32_t p = first; p <= last; ++p) {
+    // the game's linear mapping of that page (none: nothing of the game's code writes there)
+    if (g_guard.memory->to_physical(g_guard.kLinear + (p << 12)) != host::Memory::kFcram + (p << 12)) continue;
+    uint16_t& n = g_guard.count[p];
+    if (pending) {
+      if (n++ == 0) guard_protect(p, true);
+    } else if (n && --n == 0) {
+      guard_protect(p, false);
+    }
+  }
+}
+
+LONG WINAPI guard_writes(EXCEPTION_POINTERS* e) {
+  const EXCEPTION_RECORD& r = *e->ExceptionRecord;
+  if (r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r.NumberParameters < 2 || r.ExceptionInformation[0] != 1 ||
+      !g_guard.memory)
+    return EXCEPTION_CONTINUE_SEARCH;
+  const uintptr_t at = r.ExceptionInformation[1], linear = reinterpret_cast<uintptr_t>(g_guard.memory->fastmem()) + g_guard.kLinear;
+  if (at < linear || at >= linear + host::Memory::kFcramSize) return EXCEPTION_CONTINUE_SEARCH;
+  const uint32_t page = static_cast<uint32_t>((at - linear) >> 12);
+  auto lock = g_guard.kernel->lock();
+  if (!g_guard.count[page]) {
+    // released by another thread meanwhile: write again; never guarded: not ours
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof info);
+    return info.Protect == PAGE_READWRITE ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+  }
+  ++g_guard.faults;
+  pn_cpu_wrote(g_guard.engine, host::Memory::kFcram + (page << 12), 0x1000);
+  if (g_guard.count[page]) g_guard.count[page] = 0, guard_protect(page, false); // whatever is left: the game's now
+  return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // CTRN_WATCH_WRITE=address: every write to the 4 bytes of guest memory there, by the game's code, the host or the
@@ -221,6 +294,8 @@ int main(int argc, char** argv) {
   case 5: image.app_memory = 32u << 20; break;
   default: image.app_memory = 64u << 20; break;
   }
+  // CTRN_APP_MEMORY_MB=n: another size, to tell a game short of memory from one that is broken (diagnosis only)
+  if (const char* mb = std::getenv("CTRN_APP_MEMORY_MB")) image.app_memory = static_cast<uint32_t>(std::atoi(mb)) << 20;
   const std::string& title = rom.title;
 
   host::Memory memory;
@@ -269,6 +344,14 @@ int main(int argc, char** argv) {
   }
 
   host::Kernel kernel(memory, module);
+#if defined(_WIN32)
+  g_crash_kernel = &kernel;
+  if (!std::getenv("CTRN_UNCACHED") && !std::getenv("CTRN_NO_GUARD")) {
+    g_guard.kernel = &kernel, g_guard.memory = &memory, g_guard.engine = engine;
+    AddVectoredExceptionHandler(1, guard_writes);
+    pn_set_pending_hook(engine, guard_pending, nullptr);
+  }
+#endif
   if (host::trace::on()) host::trace::start(module);
   host::GfxNatives gfx_natives(kernel, engine);
   kernel.set_natives([&](host::Thread& thread, uint32_t which) { return gfx_natives.call(thread, which); });
@@ -392,6 +475,19 @@ int main(int argc, char** argv) {
     test_input.apply(frames, frame_input);
     {
       auto lock = kernel.lock();
+      test_input.write(frames, memory);
+      // CTRN_DUMP=frame:file: the game's mapped memory at that frame, as (address, 4 KiB) records, to diff runs
+      static const char* dump_env = std::getenv("CTRN_DUMP");
+      if (dump_env && std::strtoull(dump_env, nullptr, 10) == frames) {
+        if (std::FILE* f = std::fopen(std::strchr(dump_env, ':') + 1, "wb")) {
+          for (uint64_t page = 0; page < 0x40000000; page += 0x1000)
+            if (const uint8_t* bytes = memory.host(static_cast<uint32_t>(page))) {
+              const uint32_t address = static_cast<uint32_t>(page);
+              std::fwrite(&address, 4, 1, f), std::fwrite(bytes, 1, 0x1000, f);
+            }
+          std::fclose(f);
+        }
+      }
       gsp.vblank();
       services.vblank(kernel, frame_input);
       const auto screens = gsp.screens();
@@ -411,8 +507,19 @@ int main(int argc, char** argv) {
         save_screen(engine, memory, screens[1], shot_dir + name, 320); // the bottom screen
       }
     }
-    if (const auto now = std::chrono::steady_clock::now(); now - rate_since >= std::chrono::seconds(10)) {
+    // CTRN_RATE_FRAMES=n: the measure every n frames instead of every 10 s, with the game's own rate (pictures per
+    // 60 frames: what the console shows) apart from the host's (pictures per second of the host's time, fixed step:
+    // how fast it could go)
+    static const uint64_t rate_frames = std::getenv("CTRN_RATE_FRAMES") ? std::strtoull(std::getenv("CTRN_RATE_FRAMES"), nullptr, 10) : 0;
+    static uint64_t rate_frame = 0;
+    if (const auto now = std::chrono::steady_clock::now();
+        rate_frames ? frames - rate_frame >= rate_frames : now - rate_since >= std::chrono::seconds(10)) {
       const double seconds = std::chrono::duration<double>(now - rate_since).count();
+      if (rate_frames)
+        std::printf("[host] frames %llu-%llu: %.1f images per 60 frames, host %.1f images/s\n",
+                    static_cast<unsigned long long>(rate_frame), static_cast<unsigned long long>(frames),
+                    60.0 * pictures / static_cast<double>(frames - rate_frame), pictures / seconds);
+      rate_frame = frames;
       double idle, engine;
       {
         auto lock = kernel.lock();
@@ -421,8 +528,8 @@ int main(int argc, char** argv) {
       // busy near 100 %: the host's CPU is what limits the game; lower, the game waits on the console's pace.
       // of it, the GPU's share (picanative, inside the game's requests) and the rest, the game's own code
       const double busy = 1.0 - (idle - idle_at) / seconds, gpu = (engine - engine_at) / seconds;
-      std::printf("[host] %.1f images/s (top screen, last 10 s), busy %.0f %% (GPU %.0f %%, game code %.0f %%)\n",
-                  pictures / seconds, 100 * busy, 100 * gpu, 100 * (busy - gpu));
+      std::printf("[host] %.1f images/s (top screen, last 10 s), busy %.0f %% (GPU %.0f %%, game code %.0f %%), frame %llu\n",
+                  pictures / seconds, 100 * busy, 100 * gpu, 100 * (busy - gpu), static_cast<unsigned long long>(frames));
       // CTRN_PEEK=address[,address...]: 16 bytes of the game's memory at each, for diagnosis
       for (const char* p = std::getenv("CTRN_PEEK"); p && *p;) {
         char* end;
@@ -492,6 +599,9 @@ int main(int argc, char** argv) {
   double times[7];
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
+#if defined(_WIN32)
+  if (g_guard.faults) std::printf("[host] the game wrote over %llu pending drawings: written first\n", static_cast<unsigned long long>(g_guard.faults));
+#endif
   std::printf("[host] engine: recording draws %.1f s (textures %.1f s, pipelines %.1f s), encoding %.1f s, waiting for "
               "the GPU %.1f s (storing to memory %.1f s), loading from memory %.1f s\n",
               times[0], times[1], times[2], times[3], times[4], times[5], times[6]);

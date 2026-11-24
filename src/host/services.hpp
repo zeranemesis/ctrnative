@@ -64,6 +64,8 @@ private:
   uint64_t hid_reset_tick_ = 0;   // when the index last came back to 0
   std::shared_ptr<Event> hid_events_[5];
   std::shared_ptr<Event> ir_events_[3]; // ir:USER's receive, send and connection status: never signaled, nothing plugged
+  std::shared_ptr<Event> nfc_events_[2]; // nfc:u's tag in range, out of range: never signaled, no amiibo
+  uint8_t nfc_state_ = 0;                 // nfc:u's tag state: 0 not initialized, 1 initialized, 2 scanning
   std::shared_ptr<SharedMemory> hid_shared_;
   // fs: the archives on host folders laid out as Zakuro lays them out, and their files' sessions
   bool fs_file(Kernel& kernel, uint32_t file, uint32_t* command);

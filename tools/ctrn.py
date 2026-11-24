@@ -839,6 +839,21 @@ def main():
                   flush=True)
     natives_changed = False
     source = natives_source(found, cursor) if found else '#include "overrides.h"\n'
+    # CTRN_TRACE_FUNCS=addr,addr (hex): those functions run as always, then the host is told their first three
+    # arguments, result and return address (svc 0xF1; it prints the calls that returned 0, or all with
+    # CTRN_TRACE_ALL=1) - a diagnosis that makes the module again, so best with a cache of its own
+    for text in filter(None, os.environ.get("CTRN_TRACE_FUNCS", "").split(",")):
+        address = int(text, 16)
+        source += (f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                   f"    const uint32_t a0 = ctx->r[0], a1 = ctx->r[1], a2 = ctx->r[2], lr = ctx->r[14];\n"
+                   f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                   f"    const uint32_t back = ctx->r[15] | (ctx->thumb ? 1u : 0u), result = ctx->r[0], r1 = ctx->r[1];\n"
+                   f"    const uint32_t r2 = ctx->r[2], r3 = ctx->r[3], r4 = ctx->r[4];\n"
+                   f"    ctx->r[0] = a0, ctx->r[1] = a1, ctx->r[2] = a2, ctx->r[3] = result, ctx->r[4] = lr;\n"
+                   f"    SVC(0x{address:08X}u, 0xF1u);\n"
+                   f"    ctx->r[0] = result, ctx->r[1] = r1, ctx->r[2] = r2, ctx->r[3] = r3, ctx->r[4] = r4;\n"
+                   f"    RETURN_TO(back);\n"
+                   f"}}\n")
     natives_dir.mkdir(exist_ok=True)
     old = (natives_dir / "gfx_natives.c").read_text() if (natives_dir / "gfx_natives.c").is_file() else ""
     if old != source:
