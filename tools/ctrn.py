@@ -881,6 +881,19 @@ def main():
                   flush=True)
     natives_changed = False
     source = natives_source(found, cursor) if found else '#include "overrides.h"\n'
+    # CTRN_FORCE_ARGS=addr:reg,... (hex): a test reaching a place a player would take hours to (a stage, a level):
+    # that function entered with that register set to the host's CTRN_FORCE_<ADDR> (hex, read when it runs: one
+    # module for every value; unset, the game's own). A diagnosis: it makes the module again
+    for text in filter(None, os.environ.get("CTRN_FORCE_ARGS", "").split(",")):
+        address, reg = (int(x, 16) for x in text.split(":")[:2])
+        source += (f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                   f"    const uint32_t r12 = ctx->r[12];\n"
+                   f"    ctx->r[12] = ctx->r[{reg}];\n"
+                   f"    SVC(0x{address:08X}u, 0xF2u);\n"
+                   f"    ctx->r[{reg}] = ctx->r[12];\n"
+                   f"    ctx->r[12] = r12;\n"
+                   f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                   f"}}\n")
     # CTRN_TRACE_FUNCS=addr,addr (hex): those functions run as always, then the host is told their first three
     # arguments, result and return address (svc 0xF1; it prints the calls that returned 0, or all with
     # CTRN_TRACE_ALL=1) - a diagnosis that makes the module again, so best with a cache of its own

@@ -664,6 +664,17 @@ void Kernel::svc(Thread& self, uint32_t number) {
     if (!taken) r[12] = 0;
     return;
   }
+  if (number == 0xF2) { // CTRN_FORCE_ARGS (ctrn.py): r12 the game's value, made CTRN_FORCE_<function>'s (hex) when
+    // set, and when CTRN_FORCE_<function>_BELOW is unset or above the game's (its levels, not its menus)
+    char name[48];
+    std::snprintf(name, sizeof name, "CTRN_FORCE_%08X", r[15]);
+    if (const char* value = std::getenv(name)) {
+      std::strcat(name, "_BELOW");
+      const char* below = std::getenv(name);
+      if (!below || r[12] < std::strtoul(below, nullptr, 16)) r[12] = static_cast<uint32_t>(std::strtoul(value, nullptr, 16));
+    }
+    return;
+  }
   if (number == 0xF1) { // CTRN_TRACE_FUNCS (ctrn.py): a traced function returned; r15 is it, r3 its result, r4 its caller
     static const bool all = std::getenv("CTRN_TRACE_ALL") != nullptr;
     if (all || r[3] == 0)

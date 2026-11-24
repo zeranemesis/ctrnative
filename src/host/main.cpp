@@ -507,18 +507,30 @@ int main(int argc, char** argv) {
     {
       auto lock = kernel.lock();
       test_input.write(frames, memory);
-      // CTRN_DUMP=frame:file: the game's mapped memory at that frame, as (address, 4 KiB) records, to diff runs
-      static const char* dump_env = std::getenv("CTRN_DUMP");
-      if (dump_env && std::strtoull(dump_env, nullptr, 10) == frames) {
-        if (std::FILE* f = std::fopen(std::strchr(dump_env, ':') + 1, "wb")) {
-          for (uint64_t page = 0; page < 0x40000000; page += 0x1000)
-            if (const uint8_t* bytes = memory.host(static_cast<uint32_t>(page))) {
-              const uint32_t address = static_cast<uint32_t>(page);
-              std::fwrite(&address, 4, 1, f), std::fwrite(bytes, 1, 0x1000, f);
-            }
-          std::fclose(f);
+      // CTRN_DUMP=frame:file[;frame:file...]: the game's mapped memory at those frames, as (address, 4 KiB)
+      // records, to diff runs
+      static const std::vector<std::pair<uint64_t, std::string>> dumps = [] {
+        std::vector<std::pair<uint64_t, std::string>> out;
+        const char* e = std::getenv("CTRN_DUMP");
+        for (std::string rest = e ? e : ""; !rest.empty();) {
+          const size_t end = rest.find(';'), colon = rest.find(':');
+          const std::string item = rest.substr(0, end);
+          if (colon != std::string::npos && colon < item.size())
+            out.emplace_back(std::strtoull(item.c_str(), nullptr, 10), item.substr(colon + 1));
+          rest = end == std::string::npos ? "" : rest.substr(end + 1);
         }
-      }
+        return out;
+      }();
+      for (const auto& [at, path] : dumps)
+        if (at == frames)
+          if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            for (uint64_t page = 0; page < 0x40000000; page += 0x1000)
+              if (const uint8_t* bytes = memory.host(static_cast<uint32_t>(page))) {
+                const uint32_t address = static_cast<uint32_t>(page);
+                std::fwrite(&address, 4, 1, f), std::fwrite(bytes, 1, 0x1000, f);
+              }
+            std::fclose(f);
+          }
       gsp.vblank();
       services.vblank(kernel, frame_input);
       const auto screens = gsp.screens();
