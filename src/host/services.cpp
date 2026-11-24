@@ -569,7 +569,11 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
       block->size = std::max<uint32_t>((size + 0xFFF) & ~0xFFFu, 0x1000);
       block->physical = kernel.allocate(Kernel::kBase, block->size, false);
       if (block->physical) std::memset(kernel.memory().physical(block->physical, block->size), 0, block->size);
-      post_parameter(kernel, {destination, 3, {}, block->physical ? kernel.add_handle(block) : 0});
+      // the Response's buffer is the memory's size: the title maps that much (none: a mapping of 0 bytes fails and
+      // Majora's Mask then captured its screen to address 0)
+      std::vector<uint8_t> told(4);
+      std::memcpy(told.data(), &block->size, 4);
+      post_parameter(kernel, {destination, 3, std::move(told), block->physical ? kernel.add_handle(block) : 0});
     }
     reply(c, command);
     return true;
@@ -603,7 +607,11 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     const uint32_t size = std::min({static_cast<uint32_t>(parameter_.buffer.size()), c[2], capacity});
     if (size) kernel.memory().write(address, parameter_.buffer.data(), size);
     c[0] = header(command, 4, 4), c[1] = kOk, c[2] = parameter_.sender, c[3] = parameter_.signal, c[4] = size;
-    c[5] = 0x10, c[6] = parameter_.handle, c[7] = static_descriptor(size, 0), c[8] = address;
+    // the handle is moved to the title: a new one at each glance or receive (it may close one before the next)
+    uint32_t handed = 0;
+    if (parameter_.handle)
+      if (auto object = kernel.resolve(parameter_.handle)) handed = kernel.add_handle(object);
+    c[5] = 0x10, c[6] = handed, c[7] = static_descriptor(size, 0), c[8] = address;
     if (command == 0x000D) has_parameter_ = false;
     return true;
   }
@@ -777,6 +785,7 @@ bool Services::ldr_ro(Kernel& kernel, uint32_t* c) {
       }
     }
     const std::string& name = cro_->last().name;
+    std::printf("[host] ldr:ro: module %s loaded at %08x\n", name.c_str(), base);
     if (!module || !module->place(name, base)) {
       std::printf("[host] ldr:ro: %s loaded at %08x has no translated code: it cannot run\n", name.c_str(), base);
       // a module the RomFS has not as a .cro file (packed, unpacked by the game): saved as the game handed it, the
@@ -1140,6 +1149,15 @@ bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
   // 5: the update's RomFS (a patch title installed apart); a cartridge's revision has none, its own RomFS is the
   // game's current data (Smash Rev 5 asks for it first)
   if (kind != 0 && kind != 5) return false;
+  // a mod's RomFS (CTRN_ROMFS, built by ctrn.py): the game's files with the mod's in place, a level 3 of its own
+  if (const char* mod = std::getenv("CTRN_ROMFS")) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(mod, error);
+    if (!error) {
+      out = {mod, 0, size, true};
+      return true;
+    }
+  }
   const uint64_t ivfc = ncch + uint64_t{u32(0x1B0)} * 0x200, size = uint64_t{u32(0x1B4)} * 0x200;
   if (!in.seekg(static_cast<std::streamoff>(ivfc)).read(reinterpret_cast<char*>(h), 0x60) || std::memcmp(h, "IVFC", 4)) return false;
   const uint32_t master = u32(0x08), log2 = u32(0x4C);

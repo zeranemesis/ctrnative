@@ -2,6 +2,8 @@
 // drawn by picanative in its SDL3 window, no emulator.
 // usage: ctrnative <module> <rom.3ds>  (or <module> <code.bin> <exheader.bin>)
 // CTRN_HEADLESS=1: no window; CTRN_FRAMES=n: stop after n frames.
+#include "profiler.hpp"
+#include "cheats.hpp"
 #include "dsp.hpp"
 #include "gfx_native.hpp"
 #include "gsp.hpp"
@@ -104,6 +106,8 @@ LONG WINAPI report_crash(EXCEPTION_POINTERS* e) {
         std::fprintf(stderr, "[host] stack +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", n, w[0], w[1], w[2], w[3],
                      w[4], w[5], w[6], w[7]);
       }
+      std::fflush(stderr);
+      g_crash_kernel->print_threads(); // without the lock: a crash report, a torn line at worst
     }
   HMODULE module = nullptr;
   char name[MAX_PATH] = "?";
@@ -326,9 +330,14 @@ int main(int argc, char** argv) {
   const std::string translated = (std::filesystem::path(argv[1]).parent_path() / "shaders.pnvs").string();
   if (!pn_load_shaders(engine, translated.c_str(), message, sizeof message))
     std::printf("[host] no shaders translated ahead (%s: %s)\n", translated.c_str(), message);
-  // the internal resolution: CTRN_SCALE times the console's (2 by default, 1 = the console's pixels)
+  // the GPU pipelines of the game's earlier runs, made again while it starts (CTRN_NO_WARM=1: not)
+  if (!std::getenv("CTRN_NO_WARM")) {
+    const std::string recipes = (std::filesystem::path(argv[1]).parent_path() / "pipelines.pnpl").string();
+    std::printf("[host] %u GPU pipelines of earlier runs made again ahead\n", pn_warm_pipelines(engine, recipes.c_str()));
+  }
+  // the internal resolution: CTRN_SCALE times the console's (1 by default, the console's pixels: an improvement is an option)
   const char* scale_env = std::getenv("CTRN_SCALE");
-  pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 2);
+  pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 1);
   const bool headless = std::getenv("CTRN_HEADLESS") != nullptr;
   pn_window* window = headless ? nullptr : pn_window_open(engine, title.c_str(), 2, message, sizeof message);
   if (!headless && !window) {
@@ -336,6 +345,26 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (window) pn_window_set_vsync(window, 0); // the loop below paces the frames
+  // CTRN_WINDOW_SHOT=scale: with each screenshot, what a window at that scale shows (w<frame>.ppm), with no window
+  pn_window* look = nullptr;
+  if (const char* shot_scale = std::getenv("CTRN_WINDOW_SHOT"))
+    look = pn_offscreen_open(engine, static_cast<uint32_t>(std::max(1, std::atoi(shot_scale))));
+  // improvements to how the screens are shown, off by default: CTRN_FILTER bilinear (the default), nearest or
+  // sharp; CTRN_EFFECTS a list of fxaa, sharpen, lcd (the 3DS screen's colors), scanlines
+  for (pn_window* target : {window, look}) {
+    if (!target) continue;
+    pn_window* window = target;
+    const std::string filter = std::getenv("CTRN_FILTER") ? std::getenv("CTRN_FILTER") : "";
+    const std::string effects = std::getenv("CTRN_EFFECTS") ? std::getenv("CTRN_EFFECTS") : "";
+    uint32_t mask = 0;
+    if (effects.find("fxaa") != std::string::npos) mask |= PN_EFFECT_FXAA;
+    if (effects.find("sharpen") != std::string::npos) mask |= PN_EFFECT_SHARPEN;
+    if (effects.find("lcd") != std::string::npos) mask |= PN_EFFECT_LCD_COLORS;
+    if (effects.find("scanlines") != std::string::npos) mask |= PN_EFFECT_SCANLINES;
+    pn_window_set_filter(window, filter == "nearest" ? 1 : filter == "sharp" ? 2 : 0, mask);
+    const std::string stereo = std::getenv("CTRN_STEREO") ? std::getenv("CTRN_STEREO") : "";
+    pn_window_set_stereo(window, stereo == "anaglyph" ? 1 : stereo == "sbs" ? 2 : 0);
+  }
   // how the screens share the window: CTRN_LAYOUT stacked (the console's), side, large or top (F10 cycles them)
   if (const char* layout = std::getenv("CTRN_LAYOUT"); window && layout) {
     const std::string name = layout;
@@ -414,7 +443,10 @@ int main(int argc, char** argv) {
         }
   };
   const uint64_t audio_ns = 160ull * 1000000000ull / 32728;
+  host::profiler::enroll("main");
+  host::profiler::start(module);
   std::thread audio([&] {
+    host::profiler::enroll("audio");
     if (fixed_step) return; // the main loop runs the blocks at their virtual times
     const auto audio_period = std::chrono::nanoseconds(audio_ns);
     auto due = std::chrono::steady_clock::now() + audio_period;
@@ -444,6 +476,7 @@ int main(int argc, char** argv) {
   auto rate_since = std::chrono::steady_clock::now();
   double idle_at = 0, engine_at = 0;
   const host::TestInput test_input;
+  const host::Cheats cheats; // CTRN_CHEATS, CTRN_CHEATS_ON: none on by default
 #if defined(_WIN32)
   static const char* watch_env = std::getenv("CTRN_WATCH_WRITE");
   if (watch_env) AddVectoredExceptionHandler(1, watch_writes), g_watch.kernel = &kernel, g_watch.module = &module;
@@ -476,18 +509,31 @@ int main(int argc, char** argv) {
     {
       auto lock = kernel.lock();
       test_input.write(frames, memory);
-      // CTRN_DUMP=frame:file: the game's mapped memory at that frame, as (address, 4 KiB) records, to diff runs
-      static const char* dump_env = std::getenv("CTRN_DUMP");
-      if (dump_env && std::strtoull(dump_env, nullptr, 10) == frames) {
-        if (std::FILE* f = std::fopen(std::strchr(dump_env, ':') + 1, "wb")) {
-          for (uint64_t page = 0; page < 0x40000000; page += 0x1000)
-            if (const uint8_t* bytes = memory.host(static_cast<uint32_t>(page))) {
-              const uint32_t address = static_cast<uint32_t>(page);
-              std::fwrite(&address, 4, 1, f), std::fwrite(bytes, 1, 0x1000, f);
-            }
-          std::fclose(f);
+      if (cheats.any()) cheats.run(memory, frame_input.buttons);
+      // CTRN_DUMP=frame:file[;frame:file...]: the game's mapped memory at those frames, as (address, 4 KiB)
+      // records, to diff runs
+      static const std::vector<std::pair<uint64_t, std::string>> dumps = [] {
+        std::vector<std::pair<uint64_t, std::string>> out;
+        const char* e = std::getenv("CTRN_DUMP");
+        for (std::string rest = e ? e : ""; !rest.empty();) {
+          const size_t end = rest.find(';'), colon = rest.find(':');
+          const std::string item = rest.substr(0, end);
+          if (colon != std::string::npos && colon < item.size())
+            out.emplace_back(std::strtoull(item.c_str(), nullptr, 10), item.substr(colon + 1));
+          rest = end == std::string::npos ? "" : rest.substr(end + 1);
         }
-      }
+        return out;
+      }();
+      for (const auto& [at, path] : dumps)
+        if (at == frames)
+          if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            for (uint64_t page = 0; page < 0x40000000; page += 0x1000)
+              if (const uint8_t* bytes = memory.host(static_cast<uint32_t>(page))) {
+                const uint32_t address = static_cast<uint32_t>(page);
+                std::fwrite(&address, 4, 1, f), std::fwrite(bytes, 1, 0x1000, f);
+              }
+            std::fclose(f);
+          }
       gsp.vblank();
       services.vblank(kernel, frame_input);
       const auto screens = gsp.screens();
@@ -505,6 +551,10 @@ int main(int argc, char** argv) {
         save_screen(engine, memory, screens[0], shot_dir + name, 400);
         std::snprintf(name, sizeof name, "/b%06llu.ppm", static_cast<unsigned long long>(frames));
         save_screen(engine, memory, screens[1], shot_dir + name, 320); // the bottom screen
+        if (look) {
+          std::snprintf(name, sizeof name, "/w%06llu.ppm", static_cast<unsigned long long>(frames));
+          pn_window_shot(look, screens.data(), (shot_dir + name).c_str());
+        }
       }
     }
     // CTRN_RATE_FRAMES=n: the measure every n frames instead of every 10 s, with the game's own rate (pictures per
@@ -599,6 +649,12 @@ int main(int argc, char** argv) {
   double times[7];
   pn_shader_stats(engine, programs);
   pn_times(engine, times);
+  host::profiler::report();
+  pn_print_stats(engine);
+  if (std::getenv("CTRN_LOG_THREADS")) {
+    auto lock = kernel.lock();
+    kernel.print_threads();
+  }
 #if defined(_WIN32)
   if (g_guard.faults) std::printf("[host] the game wrote over %llu pending drawings: written first\n", static_cast<unsigned long long>(g_guard.faults));
 #endif

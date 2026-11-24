@@ -8,8 +8,11 @@ Options:
   --host PATH        ctrnative's executable (default: build/ctrnative next to this repository's tools)
   --build-only       translate and compile, do not run
 The game's saves go to CTRN_USER_DIR (default: <cache>/user)."""
+
 import argparse, hashlib, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
+
+import romfs  # a mod's RomFS (tools/romfs.py)
 
 HERE = Path(__file__).resolve().parent
 
@@ -781,7 +784,27 @@ def main():
     args = parser.parse_args()
     rom = args.rom.resolve()
     title_id, digest = game_identity(rom)
-    game = args.cache / "games" / f"{title_id:016X}-{digest[:12]}"
+    # a mod, as Luma3DS has them: <mods>/luma/titles/<id>/ (or <mods>/<id>/), its romfs folder and its code.ips;
+    # <mods> is CTRN_MODS_DIR or %LOCALAPPDATA%/ctrnative/mods; CTRN_NO_MODS=1 plays the game as it is
+    mod_dir, mod_digest = None, ""
+    if not os.environ.get("CTRN_NO_MODS"):
+        mods_root = Path(os.environ.get("CTRN_MODS_DIR") or default_cache() / "mods")
+        for candidate in (mods_root / "luma" / "titles" / f"{title_id:016X}", mods_root / f"{title_id:016X}"):
+            if (candidate / "romfs").is_dir() or (candidate / "code.ips").is_file():
+                mod_dir = candidate
+                break
+    if mod_dir:
+        h = hashlib.sha256()
+        for p in sorted(mod_dir.rglob("*")):
+            if p.is_file():
+                h.update(str(p.relative_to(mod_dir)).encode() + b"\0" + str(p.stat().st_size).encode() + b"\0" +
+                         str(p.stat().st_mtime_ns).encode())
+        mod_digest = h.hexdigest()[:8]
+        print(f"[ctrn] mod {mod_dir} ({mod_digest})", flush=True)
+    # a mod that changes code (code.ips, modules) has a cache of its own; one of data files shares the game's
+    code_mod = bool(mod_dir) and ((mod_dir / "code.ips").is_file() or any(
+        p.suffix.lower() in (".cro", ".crs", ".crr") for p in (mod_dir / "romfs").rglob("*")))
+    game = args.cache / "games" / (f"{title_id:016X}-{digest[:12]}" + (f"-mod{mod_digest}" if code_mod else ""))
     module = game / ("module.dll" if os.name == "nt" else "module.so")
 
     hints = game / "hints.txt"  # function starts 3dsrecomp cannot find, one address a line
@@ -802,8 +825,13 @@ def main():
         overrides = ["--overrides", str(natives_dir)] if (natives_dir / "gfx_natives.c").is_file() else []
         # modules the game loaded that its RomFS has not as files (saved by the host when it met them)
         modules = ["--modules", str(modules_dir)] if any(modules_dir.glob("*.cro")) else []
-        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides, *modules],
-                       check=True)
+        mod_args = []
+        if code_mod and (game / "mod-code.bin").is_file():
+            mod_args += ["--code", str(game / "mod-code.bin")]
+        if code_mod and (mod_dir / "romfs").is_dir():
+            mod_args += ["--romfs-dir", str(mod_dir / "romfs")]
+        subprocess.run([recomp, "generate", str(rom), str(game / "recomp"), "--hints", str(hints), *overrides, *modules,
+                        *mod_args], check=True)
         translated = time.monotonic()
         print(f"[ctrn] translated in {translated - start:.0f} s; compiling it (a few minutes the first time)", flush=True)
         subprocess.run([sys.executable, str(HERE / "build_module.py"), str(game / "recomp"), str(module),
@@ -813,6 +841,20 @@ def main():
     exheader, code = read_code(rom)
     text_start, text_pages = struct.unpack_from("<II", exheader, 0x10)
     game.mkdir(parents=True, exist_ok=True)
+    # the mod's code: its IPS patch over the game's (decompressed, as Luma patches it); its RomFS: the game's with
+    # the mod's files in place, built once into the cache
+    if mod_dir and (mod_dir / "code.ips").is_file():
+        code = romfs.apply_ips(code, (mod_dir / "code.ips").read_bytes())
+        (game / "mod-code.bin").write_bytes(code)
+    mod_romfs = game / f"romfs-{mod_digest}.bin"
+    if mod_dir and (mod_dir / "romfs").is_dir() and not mod_romfs.is_file():
+        start = time.monotonic()
+        at, _ = romfs.level3(rom)
+        tree = romfs.read_tree(str(rom), at)
+        count = romfs.overlay(tree, str(mod_dir / "romfs"))
+        romfs.write(tree, str(mod_romfs))
+        print(f"[ctrn] the mod's RomFS: {count} files over the game's, built in {time.monotonic() - start:.0f} s",
+              flush=True)
     hints.touch()  # 3dsrecomp refuses a missing --hints file, and a game may have none
     # what the code's own patterns say 3dsrecomp cannot find; a cache made before a pattern was known gets it too
     known = {int(word, 16) for word in hints.read_text().split()} if hints.is_file() else set()
@@ -839,6 +881,19 @@ def main():
                   flush=True)
     natives_changed = False
     source = natives_source(found, cursor) if found else '#include "overrides.h"\n'
+    # CTRN_FORCE_ARGS=addr:reg,... (hex): a test reaching a place a player would take hours to (a stage, a level):
+    # that function entered with that register set to the host's CTRN_FORCE_<ADDR> (hex, read when it runs: one
+    # module for every value; unset, the game's own). A diagnosis: it makes the module again
+    for text in filter(None, os.environ.get("CTRN_FORCE_ARGS", "").split(",")):
+        address, reg = (int(x, 16) for x in text.split(":")[:2])
+        source += (f"RECOMP_OVERRIDE(0x{address:08X}) {{\n"
+                   f"    const uint32_t r12 = ctx->r[12];\n"
+                   f"    ctx->r[12] = ctx->r[{reg}];\n"
+                   f"    SVC(0x{address:08X}u, 0xF2u);\n"
+                   f"    ctx->r[{reg}] = ctx->r[12];\n"
+                   f"    ctx->r[12] = r12;\n"
+                   f"    CALL(RECOMP_ORIGINAL(0x{address:08X}));\n"
+                   f"}}\n")
     # CTRN_TRACE_FUNCS=addr,addr (hex): those functions run as always, then the host is told their first three
     # arguments, result and return address (svc 0xF1; it prints the calls that returned 0, or all with
     # CTRN_TRACE_ALL=1) - a diagnosis that makes the module again, so best with a cache of its own
@@ -885,6 +940,18 @@ def main():
         subprocess.run([sys.executable, str(HERE / "shared_font.py"), str(stand_in)], check=True)
     env.setdefault("CTRN_SHARED_FONT", str(dump if dump.is_file() else stand_in))
     env["CTRN_MODULES_DIR"] = str(modules_dir)
+    # cheats, as Luma3DS has them: <cheats>/<title ID>.txt (Action Replay codes under [names]), <cheats> being
+    # CTRN_CHEATS_DIR or %LOCALAPPDATA%/ctrnative/cheats; the codes on are the names in <title ID>.on, one a line
+    # (or CTRN_CHEATS_ON=name;name); none by default
+    cheats_dir = Path(os.environ.get("CTRN_CHEATS_DIR") or default_cache() / "cheats")
+    cheats_file = cheats_dir / f"{title_id:016X}.txt"
+    if "CTRN_CHEATS" not in env and cheats_file.is_file():
+        env["CTRN_CHEATS"] = str(cheats_file)
+        on_file = cheats_dir / f"{title_id:016X}.on"
+        if "CTRN_CHEATS_ON" not in env and on_file.is_file():
+            env["CTRN_CHEATS_ON"] = ";".join(l.strip() for l in on_file.read_text(encoding="utf-8").splitlines() if l.strip())
+    if mod_dir and mod_romfs.is_file():
+        env["CTRN_ROMFS"] = str(mod_romfs)  # the host serves it in place of the ROM's
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:
     # that address becomes a hint, the module is rebuilt (only what changed) and the game starts again
     for attempt in range(80):  # each new hint or module costs a rebuild and a fresh start

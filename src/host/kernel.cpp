@@ -1,3 +1,4 @@
+#include "profiler.hpp"
 #include "kernel.hpp"
 
 #include <algorithm>
@@ -40,6 +41,7 @@ void start_host_thread(void (*body)(void*), void* argument) {
       nullptr, kStack,
       [](void* p) -> unsigned {
         auto* s = static_cast<Start*>(p);
+        profiler::enroll("game");
         s->body(s->argument);
         delete s;
         return 0;
@@ -190,6 +192,12 @@ void Kernel::load(const Image& image) {
   std::memcpy(shared + 0x60, mac, 6);
   shared[0x66] = 3, shared[0x67] = 2;
   shared[0x85] = 0x15; // battery
+  // CTRN_STEREO (anaglyph or sbs): the 3D slider all the way up, so games draw the right eye (0x84 stays 0: set,
+  // NSMB2 takes a constant instead of the slider)
+  if (const char* stereo = std::getenv("CTRN_STEREO"); stereo && *stereo) {
+    const float up = 1.0f;
+    std::memcpy(shared + 0x80, &up, 4);
+  }
   // shortcut: the date and time slots (0x20, 0x40) stay 0; fill them from the host clock when a game reads them
 
   create_thread(image.text_address, 0x10000000, 0, image.priority); // the main thread: no handle, as Zakuro
@@ -247,6 +255,27 @@ std::shared_ptr<Object> Kernel::resolve(uint32_t handle) {
   if (handle == 0xFFFF8001) return process_;
   const auto found = handles_.find(handle);
   return found == handles_.end() ? nullptr : found->second;
+}
+
+void Kernel::print_threads() {
+  static const char* states[] = {"ready", "running", "sleeping", "waiting", "arbiter", "dead"};
+  static const char* kinds[] = {"thread", "event", "mutex", "semaphore", "timer", "arbiter", "shared", "session", "port", "process", "limit"};
+  const auto at = now();
+  for (const auto& t : threads_) {
+    if (t->state == Thread::State::Dead) continue;
+    std::printf("[threads] id %u prio %d %s pc %08x lr %08x sp %08x", t->id, t->priority, states[static_cast<int>(t->state)],
+                t->ctx.r[15], t->ctx.r[14], t->ctx.r[13]);
+    if (t->wake_at != Clock::time_point::max())
+      std::printf(" wakes in %.3f ms", std::chrono::duration<double, std::milli>(t->wake_at - at).count());
+    for (const auto& o : t->waiting) {
+      std::printf(" %s%s", t->wait_all ? "&" : "|", kinds[static_cast<int>(o->kind)]);
+      if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port) std::printf(":%s", static_cast<const Session&>(*o).name.c_str());
+      if (o->kind == Object::Kind::Event) std::printf("(%s)", static_cast<const Event&>(*o).signaled ? "set" : "unset");
+      if (o->kind == Object::Kind::Mutex) std::printf("(owner %u)", static_cast<const Mutex&>(*o).owner ? static_cast<const Mutex&>(*o).owner->id : 0);
+    }
+    std::printf("\n");
+  }
+  std::fflush(stdout);
 }
 
 void Kernel::stop(const std::string& why) {
@@ -633,6 +662,17 @@ void Kernel::svc(Thread& self, uint32_t number) {
   if (number == 0xF0) { // the launcher's natives: the host's own work, no kernel state (they lock their own)
     const bool taken = natives_ && natives_(self, r[12]);
     if (!taken) r[12] = 0;
+    return;
+  }
+  if (number == 0xF2) { // CTRN_FORCE_ARGS (ctrn.py): r12 the game's value, made CTRN_FORCE_<function>'s (hex) when
+    // set, and when CTRN_FORCE_<function>_BELOW is unset or above the game's (its levels, not its menus)
+    char name[48];
+    std::snprintf(name, sizeof name, "CTRN_FORCE_%08X", r[15]);
+    if (const char* value = std::getenv(name)) {
+      std::strcat(name, "_BELOW");
+      const char* below = std::getenv(name);
+      if (!below || r[12] < std::strtoul(below, nullptr, 16)) r[12] = static_cast<uint32_t>(std::strtoul(value, nullptr, 16));
+    }
     return;
   }
   if (number == 0xF1) { // CTRN_TRACE_FUNCS (ctrn.py): a traced function returned; r15 is it, r3 its result, r4 its caller
