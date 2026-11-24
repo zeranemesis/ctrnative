@@ -940,6 +940,16 @@ def main():
         subprocess.run([sys.executable, str(HERE / "shared_font.py"), str(stand_in)], check=True)
     env.setdefault("CTRN_SHARED_FONT", str(dump if dump.is_file() else stand_in))
     env["CTRN_MODULES_DIR"] = str(modules_dir)
+    # cheats, as Luma3DS has them: <cheats>/<title ID>.txt (Action Replay codes under [names]), <cheats> being
+    # CTRN_CHEATS_DIR or %LOCALAPPDATA%/ctrnative/cheats; the codes on are the names in <title ID>.on, one a line
+    # (or CTRN_CHEATS_ON=name;name); none by default
+    cheats_dir = Path(os.environ.get("CTRN_CHEATS_DIR") or default_cache() / "cheats")
+    cheats_file = cheats_dir / f"{title_id:016X}.txt"
+    if "CTRN_CHEATS" not in env and cheats_file.is_file():
+        env["CTRN_CHEATS"] = str(cheats_file)
+        on_file = cheats_dir / f"{title_id:016X}.on"
+        if "CTRN_CHEATS_ON" not in env and on_file.is_file():
+            env["CTRN_CHEATS_ON"] = ";".join(l.strip() for l in on_file.read_text(encoding="utf-8").splitlines() if l.strip())
     if mod_dir and mod_romfs.is_file():
         env["CTRN_ROMFS"] = str(mod_romfs)  # the host serves it in place of the ROM's
     # a run that reaches code 3dsrecomp did not find (a call through a computed address) stops there:

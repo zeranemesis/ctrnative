@@ -3,6 +3,7 @@
 // usage: ctrnative <module> <rom.3ds>  (or <module> <code.bin> <exheader.bin>)
 // CTRN_HEADLESS=1: no window; CTRN_FRAMES=n: stop after n frames.
 #include "profiler.hpp"
+#include "cheats.hpp"
 #include "dsp.hpp"
 #include "gfx_native.hpp"
 #include "gsp.hpp"
@@ -475,6 +476,7 @@ int main(int argc, char** argv) {
   auto rate_since = std::chrono::steady_clock::now();
   double idle_at = 0, engine_at = 0;
   const host::TestInput test_input;
+  const host::Cheats cheats; // CTRN_CHEATS, CTRN_CHEATS_ON: none on by default
 #if defined(_WIN32)
   static const char* watch_env = std::getenv("CTRN_WATCH_WRITE");
   if (watch_env) AddVectoredExceptionHandler(1, watch_writes), g_watch.kernel = &kernel, g_watch.module = &module;
@@ -507,6 +509,7 @@ int main(int argc, char** argv) {
     {
       auto lock = kernel.lock();
       test_input.write(frames, memory);
+      if (cheats.any()) cheats.run(memory, frame_input.buttons);
       // CTRN_DUMP=frame:file[;frame:file...]: the game's mapped memory at those frames, as (address, 4 KiB)
       // records, to diff runs
       static const std::vector<std::pair<uint64_t, std::string>> dumps = [] {
