@@ -7,6 +7,7 @@
 #include <picanative/api.h>
 
 #include <array>
+#include <map>
 #include <memory>
 
 namespace host {
@@ -22,6 +23,11 @@ public:
   // the screens refresh: the pictures set for them are taken, a ring held for
   // it runs, the vertical blank interrupts go out (with the kernel's lock)
   void vblank();
+  // seconds spent in the GPU's requests and refreshes (picanative's work, with the kernel's lock)
+  double engine_seconds = 0;
+  // by kind (CTRN_SVC_STATS): command lists, FlushDataCache, InvalidateDataCache, transfers and fills, refreshes
+  std::map<std::array<uint32_t, 3>, std::pair<uint64_t, double>> transfer_kinds; // count, seconds
+  double kind_seconds[7] = {}; // ..., 5 display transfers, 6 texture copies (3 fills only)
   // what the window shows (with the kernel's lock)
   std::array<pn_screen, 2> screens() const;
 

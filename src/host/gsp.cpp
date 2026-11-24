@@ -1,5 +1,9 @@
 #include "gsp.hpp"
+#include "trace.hpp"
 
+#include <chrono>
+
+#include <cstdlib>
 #include <cstring>
 
 namespace host {
@@ -69,6 +73,7 @@ std::array<pn_screen, 2> Gsp::screens() const {
     auto reg = [&](uint32_t r) { return registers_[(kLcd[s] + r) / 4]; };
     const bool b = reg(kSelect) & 1;
     out[s].address = force_black_ ? 0 : (b ? reg(kBLeft) : reg(kALeft));
+    out[s].right = force_black_ ? 0 : (b ? reg(kBRight) : reg(kARight));
     out[s].format = reg(kFormat);
     out[s].stride = reg(kStride);
   }
@@ -92,6 +97,9 @@ void Gsp::apply_framebuffer_updates() {
     registers_[(lcd + kFormat) / 4] = m.read32(entry + 0x10);
     registers_[(lcd + kSelect) / 4] = index & 1;
     m.write32(record, index); // picked up: the flag clears, as the real GSP does
+    // CTRN_LOG_SCREENS=1: each picture a screen is handed
+    static const bool log = std::getenv("CTRN_LOG_SCREENS") != nullptr;
+    if (log) std::printf("[gsp] screen %u: index %u, left %08x, format %x\n", s, index, left, m.read32(entry + 0x10));
   }
 }
 
@@ -112,6 +120,15 @@ bool Gsp::outdrawn() {
   }
   return held_;
 }
+
+namespace {
+// adds the time from its making to its end to a counter
+struct Timed {
+  double& total;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  ~Timed() { total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
+};
+} // namespace
 
 void Gsp::run_ring() {
   const uint32_t base = shared();
@@ -137,7 +154,8 @@ void Gsp::run_ring() {
       break;
     }
     case 0x01: // ProcessCommandList(address, size)
-      pn_command_list(engine_, physical(d[0] & ~7u), d[1] & ~3u);
+      if (trace::on()) trace::submitted(m, d[0] & ~7u, d[1] & ~3u);
+      { Timed t{kind_seconds[0]}; pn_command_list(engine_, physical(d[0] & ~7u), d[1] & ~3u); }
       interrupt(kP3d);
       break;
     case 0x02: // MemoryFill(start0, value0, end0, start1, value1, end1, controls)
@@ -145,16 +163,28 @@ void Gsp::run_ring() {
         const uint32_t start = d[bank * 3], value = d[bank * 3 + 1], end = d[bank * 3 + 2];
         if (!start || end <= start) continue;
         const uint32_t p = physical(start);
+        Timed t{kind_seconds[3]};
         pn_memory_fill(engine_, p, p + (end - start), value, fill_width(d[6] >> (bank * 16)));
         interrupt(bank ? kPsc1 : kPsc0);
       }
       break;
     case 0x03: // DisplayTransfer(input, output, input dims, output dims, flags)
-      pn_display_transfer(engine_, physical(d[0]), physical(d[1]), d[2], d[3], d[4]);
+      {
+        const auto start = std::chrono::steady_clock::now();
+        pn_display_transfer(engine_, physical(d[0]), physical(d[1]), d[2], d[3], d[4]);
+        const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        kind_seconds[5] += took;
+        // CTRN_SVC_STATS: the time each kind of transfer (dimensions, flags) takes
+        static const bool stats = std::getenv("CTRN_SVC_STATS") != nullptr;
+        if (stats) {
+          auto& [count, total] = transfer_kinds[{d[2], d[3], d[4]}];
+          ++count, total += took;
+        }
+      }
       interrupt(kPpf);
       break;
     case 0x04: // TextureCopy(input, output, size, input gap, output gap)
-      pn_texture_copy(engine_, physical(d[0]), physical(d[1]), d[2], d[3], d[4]);
+      { Timed t{kind_seconds[6]}; pn_texture_copy(engine_, physical(d[0]), physical(d[1]), d[2], d[3], d[4]); }
       interrupt(kPpf);
       break;
     default: break; // 0x05 CacheFlush: memory is coherent
@@ -162,7 +192,9 @@ void Gsp::run_ring() {
   }
 }
 
+
 void Gsp::vblank() {
+  Timed timed{engine_seconds}, refresh{kind_seconds[4]};
   apply_framebuffer_updates();
   has_waiting_ = {};
   if (held_) {
@@ -176,6 +208,7 @@ void Gsp::vblank() {
 
 bool Gsp::handle(Thread& thread, uint32_t* c) {
   (void)thread;
+  Timed timed{engine_seconds};
   Memory& m = kernel_.memory();
   const uint32_t id = c[0] >> 16;
   auto reply = [&](uint32_t words = 0, uint32_t value = 0) {
@@ -229,11 +262,11 @@ bool Gsp::handle(Thread& thread, uint32_t* c) {
     reply();
     return true;
   case 0x0008: // FlushDataCache(address, size): the CPU wrote what the GPU will read
-    pn_cpu_wrote(engine_, physical(c[1]), c[2]);
+    { Timed t{kind_seconds[1]}; pn_cpu_wrote(engine_, physical(c[1]), c[2]); }
     reply();
     return true;
   case 0x0009: // InvalidateDataCache(address, size): the CPU will read what the GPU wrote
-    pn_sync_for_cpu(engine_, physical(c[1]), c[2]);
+    { Timed t{kind_seconds[2]}; pn_sync_for_cpu(engine_, physical(c[1]), c[2]); }
     reply();
     return true;
   case 0x001F: // StoreDataCache
@@ -257,8 +290,8 @@ bool Gsp::handle(Thread& thread, uint32_t* c) {
       block_->size = kSharedSize;
       block_->physical = kernel_.allocate(Kernel::kBase, kSharedSize, false);
       std::memset(m.physical(block_->physical, kSharedSize), 0, kSharedSize);
-      block_handle_ = kernel_.add_handle(block_);
     }
+    block_handle_ = kernel_.add_handle(block_); // a new handle each time: a game may have closed the last one
     // 0x2A07 with success: the GPU was already set up (as Zakuro, the title skips its own setup)
     c[0] = header(id, 2, 2), c[1] = 0x2A07, c[2] = 0, c[3] = 0, c[4] = block_handle_;
     return true;

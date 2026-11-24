@@ -14,7 +14,7 @@ if (NOT EXISTS "${RECOMP_DIR}/recomp.h")
 endif ()
 
 set(HOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/host")
-set(HOST_SOURCES main.cpp input.cpp rom.cpp kernel.cpp memory.cpp module.cpp services.cpp gsp.cpp dsp.cpp native.cpp)
+set(HOST_SOURCES main.cpp input.cpp rom.cpp kernel.cpp memory.cpp module.cpp cro.cpp trace.cpp aac.cpp gfx_native.cpp services.cpp gsp.cpp dsp.cpp y2r.cpp native.cpp profiler.cpp cheats.cpp overlay.cpp)
 list(TRANSFORM HOST_SOURCES PREPEND "${HOST_DIR}/")
 if (ANDROID)
   # libmain.so, which SDL's activity loads; the engine and SDL3 from picanative's Android build
@@ -35,8 +35,15 @@ else ()
     add_custom_command(TARGET ctrnative POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PICANATIVE_DIR}/build/Release/${dll}.dll" "$<TARGET_FILE_DIR:ctrnative>")
   endforeach ()
+  # the shader translator tools/ctrn.py runs when it builds a game
+  add_custom_command(TARGET ctrnative POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PICANATIVE_DIR}/build/Release/pn_shaders.exe" "$<TARGET_FILE_DIR:ctrnative>")
 endif ()
 target_include_directories(ctrnative PRIVATE "${RECOMP_DIR}" "${PICANATIVE_DIR}/include")
 if (MSVC)
   target_compile_options(ctrnative PRIVATE /W4 /permissive- /utf-8)
+  # symbols beside the optimized host (.pdb): CTRN_PROFILE's report and crash reports name the functions
+  target_compile_options(ctrnative PRIVATE /Zi)
+  target_link_options(ctrnative PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+  target_link_libraries(ctrnative PRIVATE dbghelp gdi32 user32)
 endif ()

@@ -122,6 +122,10 @@ public:
   std::string wait();
 
   void set_services(ServiceHandler handler) { services_ = std::move(handler); }
+  // the natives library functions are replaced by (svc 0xF0 from the launcher's overrides, see docs/RENDU-NATIF.md):
+  // true when one took the call (its results in the registers), false to run the game's own function
+  using NativeHandler = std::function<bool(Thread&, uint32_t which)>;
+  void set_natives(NativeHandler handler) { natives_ = std::move(handler); }
   // what the game asked of the 3DS system: svcs by number and return address,
   // service requests by service and command (what is left to make native)
   void report() const;
@@ -140,11 +144,21 @@ public:
   void wake();
   std::unique_lock<std::mutex> lock() { return std::unique_lock<std::mutex>(mutex_); }
   void stop(const std::string& why);   // ends the run with this reason
+  void print_threads();                 // each thread's state and what it waits for (the lock held)
   Memory& memory() { return memory_; }
   uint64_t ticks() const;
+  // CTRN_FIXED_STEP: the game's time is virtual (set before start); the host moves it to `ns` (from the start) and
+  // waits until the game can do nothing more before then (with the lock)
+  void set_virtual_time(bool on) { virtual_ = on; }
+  bool virtual_time() const { return virtual_; }
+  void advance_to(uint64_t ns, std::unique_lock<std::mutex>& lock);
   // physical memory from the process's regions (bottom or top), 0 when out
   uint32_t allocate(int region, uint32_t size, bool top);
+  void release(uint32_t physical, uint32_t size); // pages allocate gave, free again
   enum { kApplication, kSystem, kBase };
+  uint32_t linear_base() const { return linear_base_; } // where FCRAM's start appears in the linear mapping
+  // the guest code the running thread last entered, for diagnostics (read without the lock)
+  uint32_t running_pc() const { return running_ ? running_->last_pc : 0; }
 
 private:
   friend struct Callbacks;
@@ -165,12 +179,15 @@ private:
   bool signaled(const Object& object, const Thread& waiter) const;
   void acquire(Object& object, Thread& waiter);
   void timekeeper();
+  void virtual_keeper(std::unique_lock<std::mutex>& lock);
+  Clock::time_point now() const; // the host's clock, or the game's virtual one
   void map_tls(Thread& thread);
 
   Memory& memory_;
   const Module& module_;
   Host host_{};
   ServiceHandler services_;
+  NativeHandler natives_;
 
   std::mutex mutex_;
   std::condition_variable wake_timekeeper_, finished_;
@@ -188,12 +205,28 @@ private:
   std::map<std::string, uint64_t> requests_;
   std::shared_ptr<Object> process_ = std::make_shared<Simple>(Object::Kind::Process);
   Clock::time_point start_ = Clock::now();
+  bool virtual_ = false;
+  uint64_t vt_ns_ = 0, target_ns_ = 0;
+  static constexpr uint64_t kSvcNanoseconds = 1000;
+  std::condition_variable reached_;
+  Clock::time_point idle_since_{};
+  Clock::duration idle_{};
+
+public:
+  // seconds so far no game thread could run (with the lock): the game waited for the console,
+  // not for the host's CPU; the busy share of a stretch of time is the rest
+  double idle_seconds() const {
+    auto idle = idle_;
+    if (idle_since_ != Clock::time_point{}) idle += Clock::now() - idle_since_;
+    return std::chrono::duration<double>(idle).count();
+  }
 
   // physical memory: the process's regions, page by page
   struct Region {
     uint32_t base, size;
     std::vector<bool> used;
   } regions_[3];
+  struct { uint32_t text, text_end, ro_end, end; } code_{}; // the game's segments, .text first
   uint32_t heap_top_ = 0x08000000;
   uint32_t linear_base_ = 0x14000000;
 };

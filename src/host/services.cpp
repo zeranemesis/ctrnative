@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <cstring>
+#include <set>
 
 namespace host {
 
@@ -117,6 +118,56 @@ void reply_handle(uint32_t* c, uint32_t command, uint32_t handle) {
 
 bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service, uint32_t* c) {
   const uint32_t command = c[0] >> 16;
+  if (service == "ldr:ro") return ldr_ro(kernel, c);
+  // the infrared port, for the Circle Pad Pro: a console with nothing plugged, which never connects
+  if (service == "ir:USER") {
+    switch (command) {
+    case 0x0018: { // InitializeIrNopShared(sizes x5, baud rate, handle descriptor, shared memory)
+      if (auto o = kernel.resolve(c[8]); o && o->kind == Object::Kind::SharedMemory) {
+        const auto& block = static_cast<const SharedMemory&>(*o);
+        const uint32_t at = block.mapped_at ? block.mapped_at : block.own_address;
+        if (at) kernel.memory().write(at + 0x0E, "\1", 1); // the header's "initialized"
+      }
+      reply(c, command);
+      return true;
+    }
+    case 0x000A: case 0x000B: case 0x000C: { // GetReceiveEvent, GetSendEvent, GetConnectionStatusEvent
+      auto& event = ir_events_[command - 0x000A];
+      if (!event) event = std::make_shared<Event>();
+      c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0, c[3] = kernel.add_handle(event);
+      return true;
+    }
+    // FinalizeIrNop, clear the buffers, RequireConnection (it never comes: the game's wait times out), AutoConnection,
+    // AnyConnection, Disconnect, ReleaseReceivedData, SetOwnMachineId
+    case 0x0002: case 0x0003: case 0x0004: case 0x0006: case 0x0007: case 0x0008: case 0x0009: case 0x0019: case 0x001A:
+      reply(c, command);
+      return true;
+    default: return false;
+    }
+  }
+  // the amiibo reader, as a New 3DS's built-in one with nothing on it: ready at once, scanning finds no tag
+  if (service == "nfc:u") {
+    switch (command) {
+    case 0x0001: nfc_state_ = 1; reply(c, command); return true; // Initialize
+    case 0x0002: nfc_state_ = 0; reply(c, command); return true; // Shutdown
+    case 0x0005: nfc_state_ = 2; reply(c, command); return true; // StartTagScanning
+    case 0x0006: case 0x0008:                                    // StopTagScanning, ResetTagScanState
+      nfc_state_ = nfc_state_ ? 1 : 0;
+      reply(c, command);
+      return true;
+    case 0x0003: case 0x0004: reply(c, command); return true; // StartCommunication, StopCommunication
+    case 0x000B: case 0x000C: { // GetTagInRangeEvent, GetTagOutOfRangeEvent
+      auto& event = nfc_events_[command - 0x000B];
+      if (!event) event = std::make_shared<Event>();
+      c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0, c[3] = kernel.add_handle(event);
+      return true;
+    }
+    case 0x000D: reply(c, command, {nfc_state_}); return true; // GetTagState
+    case 0x000F: reply(c, command, {2}); return true;          // CommunicationGetStatus: connected
+    case 0x0012: reply(c, command, {0}); return true;          // CommunicationGetResult: no error
+    default: return false;
+    }
+  }
   if (service == "srv:") {
     switch (command) {
     case 0x0001: reply(c, command); return true; // RegisterClient
@@ -166,6 +217,9 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
     case 0x0814: case 0x0815: case 0x0849: reply(c, command, {0x200, 0x4000, 0x80000, 0x80000}); return true;
     case 0x0817: case 0x0818: case 0x0821: case 0x083D: reply(c, command, {1}); return true;
     case 0x0862: fs_priority_ = c[1], reply(c, command); return true;
+    // GetThisSaveDataSecureValue(slot): the save's anti-rollback value; none was ever set here (a new save):
+    // exists 0, not a game card's, value 0
+    case 0x086F: reply(c, command, {0, 0, 0, 0}); return true;
     case 0x080C: { // OpenArchive(archive, path type, path size, <path>)
       uint32_t path[3] = {};
       kernel.memory().read(c[5], path, std::min<uint32_t>(c[3], sizeof path));
@@ -187,12 +241,19 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
         c[0] = header(command, 3, 0), c[1] = kOk, c[2] = uint32_t(handle), c[3] = uint32_t(handle >> 32);
         return true;
       }
-      if (c[1] != 7) return false; // other archives: not native yet
-      // shared extra data: media, then the 64-bit id
-      const char* user = std::getenv("CTRN_USER_DIR");
-      char name[17];
-      std::snprintf(name, sizeof name, "%016llX", (unsigned long long)(path[1] | uint64_t{path[2]} << 32));
-      const std::filesystem::path root = std::filesystem::path(user ? user : "user") / "extdata" / "shared" / name;
+      if (c[1] == 9 || c[1] == 0xA) { // the SD card (0xA write-only): a directory of the host, always there
+        const char* user = std::getenv("CTRN_USER_DIR");
+        const std::filesystem::path root = std::filesystem::path(user ? user : "user") / "sdmc";
+        std::error_code ignored;
+        std::filesystem::create_directories(root, ignored);
+        const uint64_t handle = next_archive_++;
+        archives_[handle] = root;
+        c[0] = header(command, 3, 0), c[1] = kOk, c[2] = uint32_t(handle), c[3] = uint32_t(handle >> 32);
+        return true;
+      }
+      if (c[1] != 6 && c[1] != 7) return false; // other archives: not native yet
+      // extra data, the game's own (6) or shared (7): media, then the 64-bit id
+      const std::filesystem::path root = extdata_root(c[1] == 7, path[1] | uint64_t{path[2]} << 32);
       std::error_code ignored;
       if (!std::filesystem::is_directory(root, ignored)) {
         if (path[1] != 0xF000000B) { // never created on this console: "not formatted" (as Zakuro)
@@ -215,11 +276,20 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       kernel.memory().read(c[10], archive_path, std::min<uint32_t>(c[4], sizeof archive_path));
       kernel.memory().read(c[12], file_path, std::min<uint32_t>(c[6], sizeof file_path));
       if (c[2] == 3) { // SelfNCCH, the game itself: its 12-byte binary file path as OpenFile's below
-        if (c[5] != 2 || c[6] != 12) return false;
+        if (c[5] != 2 || c[6] != 12) {
+          std::printf("[host] fs: SelfNCCH opened with file path type %u size %u (%08x %08x %08x %08x %08x), archive "
+                      "path type %u size %u\n", c[5], c[6], file_path[0], file_path[1], file_path[2], file_path[3],
+                      file_path[4], c[3], c[4]);
+          return false;
+        }
         char exefs_name[9] = {};
         std::memcpy(exefs_name, file_path + 1, 8);
         HostFile rom;
-        if (!section_in_rom(file_path[0], exefs_name, rom)) return false;
+        if (!section_in_rom(file_path[0], exefs_name, rom)) {
+          std::printf("[host] fs: SelfNCCH section %08x (%08x %08x) not in the ROM\n", file_path[0], file_path[1],
+                      file_path[2]);
+          return false;
+        }
         const uint32_t id = next_file_++;
         files_[id] = rom;
         auto session = std::make_shared<Session>(Object::Kind::Session, "FSFile");
@@ -230,7 +300,19 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       // the console's system titles (NCCH archive, NAND, a RomFS): the stand-ins Zakuro
       // gives: the Mii data an empty CFL_Res.dat (titles start, with no Mii to draw);
       // shortcut: the region manifest and the bad word list come as empty files, build them if a game reads them
-      if (c[2] != 0x2345678A || archive_path[2] != 0 || file_path[0] != 0) return false;
+      // the media type is the low byte (titles leave the rest unset)
+      // a title's add-on content (0004008C) not installed: not found, as for a player without the DLC (Smash
+      // looks for it at its start and goes on without)
+      if (c[2] == 0x2345678A && archive_path[1] == 0x0004008C) {
+        c[0] = header(command, 1, 0), c[1] = 0xC8804478; // FS: not found
+        return true;
+      }
+      if (c[2] != 0x2345678A || (archive_path[2] & 0xFF) != 0 || file_path[0] != 0) {
+        std::printf("[host] fs: a system file not native yet: archive %08x path %08x %08x %08x %08x, file %08x %08x %08x\n",
+                    c[2], archive_path[0], archive_path[1], archive_path[2], archive_path[3], file_path[0], file_path[1],
+                    file_path[2]);
+        return false;
+      }
       std::vector<uint8_t> data;
       if (archive_path[1] == 0x0004009B && archive_path[0] == 0x00010202)
         data = romfs({{"CFL_Res.dat", std::vector<uint8_t>(0x1000)}});
@@ -302,6 +384,38 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       reply(c, command);
       return true;
     }
+    case 0x0809: // CreateDirectory(transaction, archive, path type, path size, attributes, <path>)
+    case 0x0806: // DeleteDirectory(transaction, archive, path type, path size, <path>)
+    case 0x0807: { // DeleteDirectoryRecursively
+      const auto found = archives_.find(c[2] | uint64_t{c[3]} << 32);
+      if (found == archives_.end() || found->second == kSelfNcch) return false;
+      const std::filesystem::path path = found->second / read_path(kernel, c[4], c[5], command == 0x0809 ? c[8] : c[7]);
+      std::error_code error;
+      bool done;
+      if (command == 0x0809) done = !std::filesystem::exists(path, error) && std::filesystem::create_directory(path, error);
+      else if (command == 0x0806) done = std::filesystem::remove(path, error);
+      else done = std::filesystem::remove_all(path, error) > 0;
+      if (!done) {
+        c[0] = header(command, 1, 0), c[1] = command == 0x0809 ? 0xC82044BE : 0xC8804471; // exists / not found
+        return true;
+      }
+      reply(c, command);
+      return true;
+    }
+    case 0x0805: // RenameFile(transaction, archive, path type, size, archive, path type, size, <path>, <path>)
+    case 0x080A: { // RenameDirectory
+      const auto from = archives_.find(c[2] | uint64_t{c[3]} << 32), to = archives_.find(c[6] | uint64_t{c[7]} << 32);
+      if (from == archives_.end() || to == archives_.end() || from->second == kSelfNcch) return false;
+      std::error_code error;
+      std::filesystem::rename(from->second / read_path(kernel, c[4], c[5], c[11]),
+                              to->second / read_path(kernel, c[8], c[9], c[13]), error);
+      if (error) {
+        c[0] = header(command, 1, 0), c[1] = 0xC8804470;
+        return true;
+      }
+      reply(c, command);
+      return true;
+    }
     case 0x080D: { // ControlArchive: commits, which host files need not
       uint32_t descriptors[4];
       for (int i = 0; i < 4; ++i) descriptors[i] = c[6 + i];
@@ -328,27 +442,49 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
       c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0x10, c[3] = kernel.add_handle(session);
       return true;
     }
-    case 0x0845: { // GetFormatInfo(archive, path type, path size, <path>) for the save data
-      if (c[1] != 4) return false;
+    case 0x0845: { // GetFormatInfo(archive, path type, path size, <path>): the save data, or extra data (6, 7)
+      if (c[1] != 4 && c[1] != 6 && c[1] != 7) return false;
+      uint32_t path[3] = {};
+      kernel.memory().read(c[5], path, std::min<uint32_t>(c[3], sizeof path));
+      const std::filesystem::path root = c[1] == 4 ? save_root() : extdata_root(c[1] == 7, path[1] | uint64_t{path[2]} << 32);
       uint32_t info[4] = {};
-      std::ifstream format(save_root().string() + ".format", std::ios::binary);
+      std::ifstream format(root.string() + ".format", std::ios::binary);
       std::error_code ignored;
-      if (!format.read(reinterpret_cast<char*>(info), sizeof info) || !std::filesystem::is_directory(save_root(), ignored)) {
+      if (!format.read(reinterpret_cast<char*>(info), sizeof info) || !std::filesystem::is_directory(root, ignored)) {
         c[0] = header(command, 1, 0), c[1] = 0xC8A04554;
         return true;
       }
       reply(c, command, {info[0], info[1], info[2], info[3] & 0xFF}); // size, directories, files, duplicate
       return true;
     }
-    case 0x084C: { // FormatSaveData(archive, path type, path size, blocks, directories, files, buckets x2, duplicate, <path>)
-      if (c[1] != 4) return false;
+    case 0x084C:   // FormatSaveData(archive, path type, path size, blocks, directories, files, buckets x2, duplicate, <path>)
+    case 0x080F: { // FormatThisUserSaveData(blocks, directories, files, buckets x2, duplicate): the same, its own
+      if (command == 0x084C && c[1] != 4) return false;
+      const uint32_t* a = command == 0x084C ? c + 4 : c + 1; // from the block count on
       const std::filesystem::path root = save_root();
       std::error_code ignored;
       std::filesystem::remove_all(root, ignored);
       std::filesystem::create_directories(root, ignored);
       // as Zakuro keeps it: size in bytes, directories, files, duplicate
-      const uint32_t info[4] = {c[4] * 512, c[5], c[6], c[9] & 0xFF};
+      const uint32_t info[4] = {a[0] * 512, a[1], a[2], a[5] & 0xFF};
       std::ofstream(root.string() + ".format", std::ios::binary).write(reinterpret_cast<const char*>(info), sizeof info);
+      reply(c, command);
+      return true;
+    }
+    case 0x0851: { // CreateExtSaveData(media, _, id low, id high, _, directories, files, size x2, icon size, <icon>)
+      const std::filesystem::path root = extdata_root(false, c[2] | uint64_t{c[3]} << 32);
+      std::error_code ignored;
+      std::filesystem::create_directories(root, ignored);
+      const uint32_t info[4] = {0, c[6], c[7], 0};
+      std::ofstream(root.string() + ".format", std::ios::binary).write(reinterpret_cast<const char*>(info), sizeof info);
+      reply(c, command);
+      return true;
+    }
+    case 0x0852: { // DeleteExtSaveData(media, _, id low, id high, _)
+      const std::filesystem::path root = extdata_root(false, c[2] | uint64_t{c[3]} << 32);
+      std::error_code ignored;
+      std::filesystem::remove_all(root, ignored);
+      std::filesystem::remove(root.string() + ".format", ignored);
       reply(c, command);
       return true;
     }
@@ -357,6 +493,13 @@ bool Services::handle(Kernel& kernel, Thread& thread, const std::string& service
     }
   }
   // daemons and the microphone: nothing to do offline, without a microphone (as Zakuro)
+  if (service == "err:f" && command == 0x0001) { // ThrowFatalError(type, result, pc, process, title, app title, ...)
+    char why[160];
+    std::snprintf(why, sizeof why, "the game threw a fatal error: type %u, result %08x, at %08x", c[1] & 0xFF, c[2], c[3]);
+    kernel.stop(why);
+    reply(c, command);
+    return true;
+  }
   if (service == "ndm:u") {
     switch (command) {
     case 0x0001: case 0x0002: case 0x0006: case 0x0007: case 0x0008: case 0x0009: case 0x000A: case 0x000E:
@@ -408,13 +551,41 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     return true;
   }
   case 0x0002: { // Initialize(app id, attributes) -> notification event, parameter event
-    auto notification = std::make_shared<Event>(), parameter = std::make_shared<Event>();
-    const uint32_t n = kernel.add_handle(notification), p = kernel.add_handle(parameter);
-    // a title starts by being handed a Wakeup parameter
-    has_parameter_ = true;
-    parameter_ = {0, 1};
-    kernel.signal(*parameter);
+    auto notification = std::make_shared<Event>();
+    apt_parameter_event_ = std::make_shared<Event>();
+    const uint32_t n = kernel.add_handle(notification), p = kernel.add_handle(apt_parameter_event_);
+    post_parameter(kernel, {0, 1}); // a title starts by being handed a Wakeup parameter
     c[0] = header(0x0002, 1, 3), c[1] = kOk, c[2] = 0x04000000, c[3] = n, c[4] = p; // two handles
+    return true;
+  }
+  case 0x000C: { // SendParameter(source, destination, signal, size, handle descriptor, handle, static descriptor, buffer)
+    const uint32_t destination = c[2], signal = c[3];
+    // to a library applet: its Request (the capture buffer's size) gets the applet's Response, with the
+    // memory it would draw into; the applet itself starts with StartLibraryApplet
+    if (destination >= 0x400 && destination < 0x500 && signal == 2) {
+      uint32_t size = 0;
+      if (c[4] >= 4) size = kernel.memory().read32(c[8]);
+      auto block = std::make_shared<SharedMemory>();
+      block->size = std::max<uint32_t>((size + 0xFFF) & ~0xFFFu, 0x1000);
+      block->physical = kernel.allocate(Kernel::kBase, block->size, false);
+      if (block->physical) std::memset(kernel.memory().physical(block->physical, block->size), 0, block->size);
+      // the Response's buffer is the memory's size: the title maps that much (none: a mapping of 0 bytes fails and
+      // Majora's Mask then captured its screen to address 0)
+      std::vector<uint8_t> told(4);
+      std::memcpy(told.data(), &block->size, 4);
+      post_parameter(kernel, {destination, 3, std::move(told), block->physical ? kernel.add_handle(block) : 0});
+    }
+    reply(c, command);
+    return true;
+  }
+  case 0x001E: { // StartLibraryApplet(applet, size, handle descriptor, handle, static descriptor, buffer)
+    std::vector<uint8_t> config(std::min<uint32_t>(c[2], 0x10000));
+    kernel.memory().read(c[6], config.data(), static_cast<uint32_t>(config.size()));
+    const uint32_t applet = c[1], memory = c[4];
+    std::printf("[apt] library applet %03x started (%zu bytes of settings): it answers at once\n", applet, config.size());
+    // the applet closes: the title wakes with what it handed back (WakeupByExit)
+    post_parameter(kernel, {applet, 0xA, run_applet(kernel, applet, std::move(config), memory), 0});
+    reply(c, command);
     return true;
   }
   case 0x0003:
@@ -425,7 +596,6 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     return true;
   case 0x0009: reply(c, command, {c[1] != 0x400 || library_applet_ ? 1u : 0u}); return true; // IsRegistered
   case 0x000B: reply(c, command, {0}); return true;                      // InquireNotification: none
-  case 0x000C: reply(c, command); return true;                           // SendParameter
   case 0x000D:                                                          // ReceiveParameter
   case 0x000E: {                                                        // GlanceParameter
     if (!has_parameter_) {
@@ -434,8 +604,14 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     }
     uint32_t address, capacity;
     static_buffer(kernel, thread, 0, address, capacity);
-    c[0] = header(command, 4, 4), c[1] = kOk, c[2] = parameter_.sender, c[3] = parameter_.signal, c[4] = 0;
-    c[5] = 0x10, c[6] = 0, c[7] = static_descriptor(0, 0), c[8] = address;
+    const uint32_t size = std::min({static_cast<uint32_t>(parameter_.buffer.size()), c[2], capacity});
+    if (size) kernel.memory().write(address, parameter_.buffer.data(), size);
+    c[0] = header(command, 4, 4), c[1] = kOk, c[2] = parameter_.sender, c[3] = parameter_.signal, c[4] = size;
+    // the handle is moved to the title: a new one at each glance or receive (it may close one before the next)
+    uint32_t handed = 0;
+    if (parameter_.handle)
+      if (auto object = kernel.resolve(parameter_.handle)) handed = kernel.add_handle(object);
+    c[5] = 0x10, c[6] = handed, c[7] = static_descriptor(size, 0), c[8] = address;
     if (command == 0x000D) has_parameter_ = false;
     return true;
   }
@@ -461,9 +637,15 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
     c[0] = header(0x0041, 2, 2), c[1] = kOk, c[2] = size, c[3] = static_descriptor(size, 0), c[4] = address;
     return true;
   }
-  case 0x0044: // GetSharedFont: shortcut: none yet (as Zakuro without a dumped font); map it if the game needs it
-    c[0] = header(0x0044, 1, 0), c[1] = 0xFFFFFFFF;
+  case 0x0044: { // GetSharedFont -> where the font's block is, and the block
+    if (!shared_font_ && !load_shared_font(kernel)) {
+      c[0] = header(0x0044, 1, 0), c[1] = 0xFFFFFFFF; // no font to hand over: what a console without one says
+      return true;
+    }
+    c[0] = header(0x0044, 2, 2), c[1] = kOk, c[2] = shared_font_->own_address, c[3] = 0;
+    c[4] = kernel.add_handle(shared_font_);
     return true;
+  }
   case 0x0035: case 0x0046: case 0x0047: reply(c, command, {0, 0}); return true;
   case 0x004B: reply(c, command, {0}); return true;                      // AppletUtility
   case 0x004F: cpu_time_limit_ = c[2], reply(c, command); return true;  // SetAppCpuTimeLimit
@@ -474,6 +656,271 @@ bool Services::apt(Kernel& kernel, Thread& thread, uint32_t* c) {
   case 0x0103: reply(c, command, {1}); return true;                      // platform: 3DS
   default: return false;
   }
+}
+
+bool Services::load_shared_font(Kernel& kernel) {
+  const char* path = std::getenv("CTRN_SHARED_FONT");
+  std::vector<uint8_t> font;
+  if (path) {
+    std::ifstream in(path, std::ios::binary);
+    font.assign(std::istreambuf_iterator<char>(in), {});
+  }
+  if (font.size() <= 0x84 || (std::memcmp(font.data() + 0x80, "CFNU", 4) && std::memcmp(font.data() + 0x80, "CFNT", 4))) {
+    std::printf("[host] APT: no shared font (CTRN_SHARED_FONT: %s)\n", path ? path : "not set");
+    return false;
+  }
+  auto get = [&](uint32_t at) { uint32_t v = 0; if (at + 4 <= font.size()) std::memcpy(&v, font.data() + at, 4); return v; };
+  auto put = [&](uint32_t at, uint32_t v) { if (at + 4 <= font.size()) std::memcpy(font.data() + at, &v, 4); };
+  const uint32_t loaded = 2; // a dump may have been taken before the system finished loading it
+  put(0, loaded);
+  const uint32_t size = (static_cast<uint32_t>(font.size()) + 0xFFF) & ~0xFFFu;
+  const uint32_t physical = kernel.allocate(Kernel::kBase, size, false);
+  if (!physical) {
+    std::printf("[host] APT: no memory for the shared font\n");
+    return false;
+  }
+  // among the system's memory where the linear mapping shows it: a title's own linear heap never reaches there
+  const uint32_t address = kernel.linear_base() + (physical - Memory::kFcram);
+  // the font's pointers are absolute: FINF's to TGLP says where it was laid out for (Zakuro's relocate)
+  uint16_t header_size = 0;
+  std::memcpy(&header_size, font.data() + 0x86, 2);
+  uint32_t finf = 0, tglp = 0;
+  for (uint32_t at = 0x80 + header_size, n = 0; n < std::min(get(0x90), 16u) && at + 8 <= font.size(); ++n) {
+    if (!std::memcmp(font.data() + at, "FINF", 4) && !finf) finf = at;
+    if (!std::memcmp(font.data() + at, "TGLP", 4) && !tglp) tglp = at;
+    if (!get(at + 4) || (finf && tglp)) break;
+    at += get(at + 4);
+  }
+  if (finf && tglp) {
+    const uint32_t laid_out = get(finf + 16) - (tglp + 8), delta = address - laid_out;
+    auto moved = [&](uint32_t at) { put(at, get(at) + delta); return get(at); };
+    for (uint32_t f : {16u, 20u, 24u}) moved(finf + f);
+    moved(tglp + 28);
+    // the widths and the maps, each section pointing on to the next one's body
+    for (auto [first, link] : {std::pair{finf + 20, 4u}, std::pair{finf + 24, 8u}}) {
+      uint32_t body = get(first);
+      for (int i = 0; i < 256 && body - address + link + 4 <= font.size() && get(body - address + link); ++i)
+        body = moved(body - address + link);
+    }
+  }
+  std::memcpy(kernel.memory().physical(physical, size), font.data(), font.size());
+  kernel.memory().map(address, physical, size, false);
+  shared_font_ = std::make_shared<SharedMemory>();
+  shared_font_->physical = physical, shared_font_->size = size, shared_font_->own_address = address;
+  std::printf("[host] APT: the shared font (%s, %zu KiB) at %08x\n", path, font.size() / 1024, address);
+  return true;
+}
+
+// ldr:ro, as Zakuro does it (services/ldr_ro.rs)
+bool Services::ldr_ro(Kernel& kernel, uint32_t* c) {
+  const uint32_t command = c[0] >> 16;
+  Memory& m = kernel.memory();
+  if (!cro_) cro_ = std::make_unique<Cro>(m);
+  constexpr uint32_t kNotLoaded = 0xD9012402;
+  auto pages = [](uint32_t size) { return (size + 0xFFF) & ~0xFFFu; };
+  // the buffer visible at address as well, the same memory; where the module is then
+  auto mirror = [&](uint32_t address, uint32_t source, uint32_t size) {
+    if (!address || address == source || (address | source) & 0xFFF) return source;
+    for (uint32_t off = 0; off < pages(size); off += 0x1000)
+      if (!m.to_physical(source + off)) return source;
+    for (uint32_t off = 0; off < pages(size); off += 0x1000) m.map(address + off, m.to_physical(source + off), 0x1000, true);
+    return address;
+  };
+  switch (command) {
+  case 0x0001: { // Initialize(CRS buffer, size, address, <process>)
+    const uint32_t base = mirror(c[3], c[1], c[2]);
+    if (!cro_->initialize(base, c[2])) {
+      c[0] = header(command, 1, 0), c[1] = kNotLoaded;
+      return true;
+    }
+    reply(c, command);
+    return true;
+  }
+  case 0x0002: case 0x0003: reply(c, command); return true; // LoadCRR, UnloadCRR: signatures, not checked
+  case 0x0004:   // LoadCRO(buffer, address, size, data, 0, data size, bss, bss size, auto link, fix level, CRR, <process>)
+  case 0x0009: { // LoadCRO_New: the same
+    const uint32_t source = c[1], address = c[2], size = c[3], data = c[4], data_size = c[6], bss = c[7];
+    const uint32_t bss_size = c[8], fix_level = c[10];
+    const bool auto_link = (c[9] & 0xFF) != 0;
+    // the module as the game hands it, before ldr:ro links it: kept to be translated if it has no code yet
+    std::vector<uint8_t> original(size);
+    m.read(source, original.data(), size);
+    uint32_t base = source;
+    if (address && address != source && !(address & 0xFFF)) {
+      if (const uint32_t physical = kernel.allocate(Kernel::kSystem, pages(size), false)) {
+        std::vector<uint8_t> bytes(size);
+        m.read(source, bytes.data(), size);
+        m.map(address, physical, pages(size), true);
+        m.write_any(address, bytes.data(), size);
+        cro_copies_[address] = {source, physical, pages(size), size};
+        base = address;
+      } else {
+        std::printf("[host] ldr:ro: no memory for a %x-byte module, it runs from its buffer\n", size);
+        base = mirror(address, source, size);
+      }
+    }
+    uint32_t fixed = 0;
+    if (!cro_->load(base, size, data, data_size, bss, bss_size, auto_link, fix_level, fixed)) {
+      std::printf("[host] ldr:ro: the buffer at %08x is not a module that loads\n", source);
+      if (auto copy = cro_copies_.find(base); copy != cro_copies_.end()) {
+        m.unmap(base, copy->second.size), kernel.release(copy->second.physical, copy->second.size);
+        cro_copies_.erase(copy);
+      }
+      c[0] = header(command, 1, 0), c[1] = kNotLoaded;
+      return true;
+    }
+    if (auto found = cro_copies_.find(base); found != cro_copies_.end()) {
+      CroCopy& copy = found->second;
+      // the module as ldr:ro left it into the buffer too: the game copies its relocated data out of there
+      std::vector<uint8_t> bytes(size);
+      m.read(base, bytes.data(), size);
+      m.write_any(copy.buffer, bytes.data(), size);
+      // what fixing dropped goes back: the game maps the next module over it
+      copy.fixed = fixed ? fixed : size;
+      const uint32_t kept = pages(copy.fixed);
+      if (kept < copy.size) {
+        m.unmap(base + kept, copy.size - kept);
+        kernel.release(copy.physical + kept, copy.size - kept);
+        copy.size = kept;
+      }
+    }
+    const std::string& name = cro_->last().name;
+    std::printf("[host] ldr:ro: module %s loaded at %08x\n", name.c_str(), base);
+    if (!module || !module->place(name, base)) {
+      std::printf("[host] ldr:ro: %s loaded at %08x has no translated code: it cannot run\n", name.c_str(), base);
+      // a module the RomFS has not as a .cro file (packed, unpacked by the game): saved as the game handed it, the
+      // launcher translates it with the others (3dsrecomp --modules) and starts the game again
+      if (const char* dir = std::getenv("CTRN_MODULES_DIR")) {
+        const std::filesystem::path path = std::filesystem::path(dir) / (name + ".cro");
+        std::error_code ignored;
+        if (!std::filesystem::exists(path, ignored)) {
+          std::filesystem::create_directories(dir, ignored);
+          std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(original.data()),
+                                                      static_cast<std::streamsize>(original.size()));
+          kernel.stop("module " + name + " saved for translation");
+        }
+      }
+    }
+    static const bool log = std::getenv("CTRN_LOG_CRO") != nullptr;
+    if (log) std::printf("[host] ldr:ro: %s at %08x, %x bytes, fixed to %x\n", name.c_str(), base, size, fixed);
+    static std::set<std::string> said;
+    for (const std::string& missing : cro_->unresolved())
+      if (said.insert(missing).second) std::printf("[host] ldr:ro: nothing exports %s yet\n", missing.c_str());
+    reply(c, command, {fixed});
+    return true;
+  }
+  case 0x0005: { // UnloadCRO(address, 0, buffer, <process>)
+    const uint32_t base = c[1];
+    if (const Cro::Module* gone = cro_->module_at(base); gone && module) module->place(gone->name, 0);
+    cro_->unload(base);
+    if (auto found = cro_copies_.find(base); found != cro_copies_.end()) {
+      // back into the buffer, what fixing left of it, as ldr:ro left it; its memory goes
+      const CroCopy copy = found->second;
+      std::vector<uint8_t> bytes(std::min(copy.fixed, copy.size));
+      m.read(base, bytes.data(), static_cast<uint32_t>(bytes.size()));
+      m.write_any(copy.buffer, bytes.data(), static_cast<uint32_t>(bytes.size()));
+      m.unmap(base, copy.size);
+      kernel.release(copy.physical, copy.size);
+      cro_copies_.erase(found);
+    }
+    reply(c, command);
+    return true;
+  }
+  case 0x0006: case 0x0007: case 0x0008: reply(c, command); return true; // linked as it loads; Shutdown
+  default: return false;
+  }
+}
+
+bool Services::answer_neutrally(const std::string& service, uint32_t* c) {
+  static const bool strict = std::getenv("CTRN_STRICT") != nullptr;
+  static const char* const core[] = {"fs:", "FS", "gsp::", "dsp::", "APT:", "srv:", "hid:", "y2r:", "ldr:", "csnd:", "err:"};
+  if (strict) return false;
+  for (const char* prefix : core)
+    if (service.rfind(prefix, 0) == 0) return false;
+  const uint32_t command = c[0] >> 16;
+  static std::set<std::pair<std::string, uint32_t>> said;
+  if (said.insert({service, command}).second)
+    std::printf("[host] %s %04x: not native yet, answered neutrally (success, zeros)\n", service.c_str(), command);
+  c[0] = header(command, 8, 0), c[1] = kOk;
+  for (int i = 2; i < 9; ++i) c[i] = 0;
+  return true;
+}
+
+void Services::post_parameter(Kernel& kernel, Parameter parameter) {
+  parameter_ = std::move(parameter);
+  has_parameter_ = true;
+  if (apt_parameter_event_) kernel.signal(*apt_parameter_event_);
+}
+
+// the layouts are libctru's (SwkbdState, MiiSelectorReturn, errorConf)
+std::vector<uint8_t> Services::run_applet(Kernel& kernel, uint32_t applet, std::vector<uint8_t> config, uint32_t memory) {
+  auto put32 = [&](std::vector<uint8_t>& b, size_t at, uint32_t v) {
+    if (at + 4 <= b.size()) std::memcpy(b.data() + at, &v, 4);
+  };
+  auto get32 = [&](size_t at) {
+    uint32_t v = 0;
+    if (at + 4 <= config.size()) std::memcpy(&v, config.data() + at, 4);
+    return v;
+  };
+  switch (applet) {
+  case 0x401: { // the software keyboard: the confirm button, with a name typed into the shared memory
+    if (config.size() < 0x14C) break;
+    auto block = kernel.resolve(memory);
+    const bool numbers = get32(0) == 1;
+    const uint32_t limit = static_cast<uint16_t>(get32(0x20));
+    std::string text = numbers ? "0" : "Player";
+    if (limit && text.size() > limit) text.resize(limit);
+    if (block && block->kind == Object::Kind::SharedMemory) {
+      auto& shared = static_cast<SharedMemory&>(*block);
+      if (uint8_t* to = kernel.memory().physical(shared.physical, shared.size))
+        for (size_t i = 0; i < text.size() && i * 2 + 2 < shared.size; ++i) to[i * 2] = uint8_t(text[i]), to[i * 2 + 1] = 0;
+    } else {
+      text.clear();
+    }
+    static const uint32_t confirm[] = {0, 2, 5}; // the rightmost button of 1, 2 or 3
+    put32(config, 0x138, confirm[std::min<uint32_t>(get32(4), 2)]);
+    put32(config, 0x144, 0);
+    config[0x148] = uint8_t(text.size()), config[0x149] = 0;
+    break;
+  }
+  case 0x402: { // the Mii selector: a standard Mii chosen ("none chosen" sends titles back to their menu)
+    std::vector<uint8_t> result(0x84);
+    put32(result, 8, 0xFFFFFFFF); // not a guest
+    uint8_t* mii = result.data() + 0xC; // the 0x5C bytes of a Mii, as 3dbrew lays them out
+    mii[0x00] = 3;                      // version
+    mii[0x01] = 1;                      // copying allowed
+    mii[0x03] = 3 << 4;                 // made on a 3DS
+    const uint8_t system[8] = {0xD2, 0x85, 0xA3, 0xBE, 0x0A, 0xDB, 0xF8, 0xDA};
+    std::memcpy(mii + 0x04, system, 8);
+    put32(result, 0xC + 0x0C, 0x8A5B2C1Du); // a normal (not special) Mii
+    const uint8_t mac[6] = {0x40, 0xF4, 0x07, 0x00, 0x00, 0x01};
+    std::memcpy(mii + 0x10, mac, 6);
+    const char name[] = "Player";
+    for (size_t i = 0; i + 1 < sizeof name; ++i) mii[0x1A + i * 2] = uint8_t(name[i]), mii[0x48 + i * 2] = uint8_t(name[i]);
+    mii[0x2E] = 0x40, mii[0x2F] = 0x40;    // height, build
+    mii[0x32] = 0x21, mii[0x33] = 0x01;    // hair
+    put32(result, 0xC + 0x34, 0x02684418); // eyes
+    put32(result, 0xC + 0x38, 0x26344614); // eyebrows
+    mii[0x3C] = 0x12, mii[0x3D] = 0x81;    // nose
+    mii[0x3E] = 0x68, mii[0x3F] = 0x17;    // mouth
+    mii[0x40] = 0x00, mii[0x41] = 0x0D;
+    mii[0x42] = 0x29, mii[0x44] = 0x52;    // beard, glasses
+    mii[0x46] = 0x50, mii[0x47] = 0x48;    // mole
+    // CRC-16/CCITT (0x1021, from 0) of the Mii and the 2 bytes after it, stored big-endian
+    uint16_t crc = 0;
+    for (size_t i = 0; i < 0x5E; ++i) {
+      crc ^= uint16_t(mii[i] << 8);
+      for (int b = 0; b < 8; ++b) crc = crc & 0x8000 ? uint16_t(crc << 1 ^ 0x1021) : uint16_t(crc << 1);
+    }
+    result[0x6A] = uint8_t(crc >> 8), result[0x6B] = uint8_t(crc);
+    return result;
+  }
+  case 0x407: // the error display and the EULA: acknowledged
+    put32(config, 0xEFC, 1);
+    break;
+  default: break; // others: their settings back, unchanged
+  }
+  return config;
 }
 
 // cfg: the console's configuration blocks
@@ -527,19 +974,17 @@ bool Services::hid(Kernel& kernel, uint32_t* c) {
   const uint32_t command = c[0] >> 16;
   switch (command) {
   case 0x000A: { // GetIPCHandles -> the shared block and five events
-    if (!hid_block_) {
+    if (!hid_shared_) {
       auto block = std::make_shared<SharedMemory>();
       block->size = 0x1000;
       block->physical = hid_physical_ = kernel.allocate(Kernel::kBase, 0x1000, false);
       std::memset(kernel.memory().physical(block->physical, 0x1000), 0, 0x1000);
-      hid_block_ = kernel.add_handle(block);
-      for (int i = 0; i < 5; ++i) {
-        hid_events_[i] = std::make_shared<Event>();
-        hid_event_handles_[i] = kernel.add_handle(hid_events_[i]);
-      }
+      hid_shared_ = block;
+      for (int i = 0; i < 5; ++i) hid_events_[i] = std::make_shared<Event>();
     }
-    c[0] = header(command, 1, 7), c[1] = kOk, c[2] = 5u << 26, c[3] = hid_block_; // six handles
-    for (int i = 0; i < 5; ++i) c[4 + i] = hid_event_handles_[i];
+    // new handles to the same block and events each time: a game may have closed the last ones
+    c[0] = header(command, 1, 7), c[1] = kOk, c[2] = 5u << 26, c[3] = kernel.add_handle(hid_shared_); // six handles
+    for (int i = 0; i < 5; ++i) c[4 + i] = kernel.add_handle(hid_events_[i]);
     return true;
   }
   case 0x0011: ++accelerometer_users_, reply(c, command); return true;
@@ -598,6 +1043,16 @@ bool Services::fs_directory(Kernel& kernel, uint32_t id, uint32_t* c) {
 // a file of an archive the service opened, on the host
 bool Services::fs_file(Kernel& kernel, uint32_t id, uint32_t* c) {
   const uint32_t command = c[0] >> 16;
+  if (command == 0x080C) { // OpenLinkFile: another session on the same file
+    const uint32_t link = next_file_++;
+    if (auto memory = memory_files_.find(id); memory != memory_files_.end()) memory_files_[link] = memory->second;
+    else if (auto file = files_.find(id); file != files_.end()) files_[link] = file->second;
+    else return false;
+    auto session = std::make_shared<Session>(Object::Kind::Session, "FSFile");
+    session->sub = link;
+    c[0] = header(command, 1, 2), c[1] = kOk, c[2] = 0x10, c[3] = kernel.add_handle(session);
+    return true;
+  }
   if (auto memory = memory_files_.find(id); memory != memory_files_.end()) {
     const std::vector<uint8_t>& bytes = memory->second;
     switch (command) {
@@ -691,7 +1146,18 @@ bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
       }
     return false;
   }
-  if (kind != 0) return false;
+  // 5: the update's RomFS (a patch title installed apart); a cartridge's revision has none, its own RomFS is the
+  // game's current data (Smash Rev 5 asks for it first)
+  if (kind != 0 && kind != 5) return false;
+  // a mod's RomFS (CTRN_ROMFS, built by ctrn.py): the game's files with the mod's in place, a level 3 of its own
+  if (const char* mod = std::getenv("CTRN_ROMFS")) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(mod, error);
+    if (!error) {
+      out = {mod, 0, size, true};
+      return true;
+    }
+  }
   const uint64_t ivfc = ncch + uint64_t{u32(0x1B0)} * 0x200, size = uint64_t{u32(0x1B4)} * 0x200;
   if (!in.seekg(static_cast<std::streamoff>(ivfc)).read(reinterpret_cast<char*>(h), 0x60) || std::memcmp(h, "IVFC", 4)) return false;
   const uint32_t master = u32(0x08), log2 = u32(0x4C);
@@ -709,6 +1175,13 @@ std::filesystem::path Services::save_root() const {
   char name[17];
   std::snprintf(name, sizeof name, "%016llX", static_cast<unsigned long long>(program_id));
   return std::filesystem::path(user ? user : "user") / "savedata" / name;
+}
+
+std::filesystem::path Services::extdata_root(bool shared, uint64_t id) const {
+  const char* user = std::getenv("CTRN_USER_DIR");
+  char name[17];
+  std::snprintf(name, sizeof name, "%016llX", static_cast<unsigned long long>(id));
+  return std::filesystem::path(user ? user : "user") / "extdata" / (shared ? "shared" : "game") / name;
 }
 
 void Services::vblank(Kernel& kernel, const Input& input) {

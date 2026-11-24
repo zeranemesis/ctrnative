@@ -52,6 +52,48 @@ minutes) ; le module est gardé en cache (`%LOCALAPPDATA%\ctrnative`), par
 identifiant du jeu et empreinte de son code. Les sauvegardes vont dans
 `<cache>/user`.
 
+Les shaders du jeu sont traduits à ce moment-là aussi : le lanceur cherche les
+binaires de shaders (blocs DVLB) dans le code et dans chaque fichier de la
+RomFS, tel quel ou décompressé (LZ10/LZ11, Yaz0, LzS), les garde dans
+`<cache>/games/<jeu>/shaders/`, et `pn_shaders` (picanative, copié à côté de
+l'hôte) les traduit dans `shaders.pnvs`, que l'hôte charge au démarrage. En fin
+de partie, l'hôte dit combien de programmes étaient traduits à l'avance et
+combien l'ont été pendant la partie (chacun est aussi journalisé) ; le but est
+zéro. La traduction est refaite quand picanative change.
+
+### Le menu
+
+`src/menu` est un menu d'accueil à deux écrans, façon console : les icônes des
+jeux en bas (lues dans la ROM), le jeu choisi en haut, ses réglages (échelle de
+rendu, disposition des écrans), et le lancement par `tools/ctrn.py` avec sa
+sortie à l'écran ; le menu revient quand le jeu se ferme. Souris (un clic
+choisit, un second lance), clavier (flèches, Entrée, Tab, Échap) ou manette.
+La page « Codes » (X, F2) coche les cheats du jeu choisi : elle lit
+`<cheats>/<id du jeu>.txt` et écrit les noms cochés dans `<id du jeu>.on`, que
+`tools/ctrn.py` passe à l'hôte ; rien n'est coché par défaut.
+Les réglages du menu passent au jeu les améliorations de l'image, toutes
+désactivées par défaut (le jeu tel qu'il est) : filtre, FXAA, accentuation,
+couleurs de l'écran 3DS, lignes de balayage, filtrage anisotrope, mipmaps, 3D,
+pack de textures (`%LOCALAPPDATA%\ctrnative\textures\<id du jeu>`). En jeu, **F1**
+ouvre un menu par-dessus l'image et met le jeu en pause : filtre, effets et 3D
+changent aussitôt, l'échelle, l'anisotropie et les mipmaps à la reprise (rendu
+rechargé). Il demande le picanative de la branche `menu` (`pn_set_texture_options`,
+`pn_set_resolution_scale` en cours de partie).
+
+```bash
+cmake -S src/menu -B build-menu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=clang-cl -DSDL3_DIR=<SDL3>/cmake
+cmake --build build-menu
+```
+
+Il lance l'hôte posé à côté de lui (`build-menu/ctrnative.exe`, avec ses DLL),
+sinon celui de `build`. Ses réglages sont dans `%LOCALAPPDATA%\ctrnative\menu.json` :
+`scale`, `layout`, `roms` (dossiers des ROM, séparés par `;`, par défaut
+`C:\jeu 3ds\extrait;C:\jeu 3ds`) et `3dsrecomp` (sinon `CTRN_3DSRECOMP`, sinon
+`../3dsrecomp*/target/release/3dsrecomp.exe`).
+
+### L'hôte seul
+
 L'hôte se lance aussi seul : `build/ctrnative <module> jeu.3ds` (il lit le
 code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 
@@ -65,7 +107,26 @@ code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 | `CTRN_PRESS_A=1`, `CTRN_TAP_AT=x,y` | essais sans joueur : A, ou un toucher, 6 images sur 60 |
 | `CTRN_INPUT_SCRIPT` | essais : lignes `début fin TOUCHES… [x=..] [y=..]`, en images |
 | `CTRN_LOG_THREADS=1` | chaque thread créé, avec sa priorité et sa pile |
+| `CTRN_LOG_IPC=1` | chaque requête aux services, au fil de la partie (sauf GPU, DSP, fichiers) |
+| `CTRN_SVC_STATS=1` | en fin de partie : appels système, requêtes, et ce que chaque thread attend |
+| `CTRN_STRICT=1` | pas de réponse par défaut des services périphériques : arrêt au premier manquant |
 | `CTRN_UNCACHED=1` | le moteur relit chaque surface (lent, pour comparer) |
+
+Toutes les 10 s, l'hôte affiche les images/s du jeu et la part du temps où son
+code travaillait : près de 100 %, c'est le processeur du PC qui limite ; plus
+bas, le jeu attend le rythme de la console (il n'y a rien à gagner côté CPU).
+
+Les services périphériques pas encore écrits (réseau, amis, StreetPass,
+contenus téléchargeables…) répondent « succès, rien à signaler », comme une
+console hors ligne, et le journal le dit une fois par commande. Les applets
+(clavier, sélecteur de Mii, messages d'erreur) se ferment aussitôt avec la
+réponse d'un joueur qui valide : un nom « Player », un Mii standard.
+
+Le lanceur trouve dans le code ce que 3dsrecomp ne voit pas : les
+constructeurs C++, les tables de sauts et les appels écrits à la main en
+assembleur (décodeurs vidéo). Il faut un 3dsrecomp où un indice donné par
+`--hints` devient toujours une entrée, même au milieu d'une fonction déjà
+trouvée ou à la place d'une fausse fonction Thumb (`apply_hints`, build.rs).
 
 ## Remerciements
 

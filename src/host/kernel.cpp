@@ -1,3 +1,4 @@
+#include "profiler.hpp"
 #include "kernel.hpp"
 
 #include <algorithm>
@@ -40,6 +41,7 @@ void start_host_thread(void (*body)(void*), void* argument) {
       nullptr, kStack,
       [](void* p) -> unsigned {
         auto* s = static_cast<Start*>(p);
+        profiler::enroll("game");
         s->body(s->argument);
         delete s;
         return 0;
@@ -70,35 +72,16 @@ void start_host_thread(void (*body)(void*), void* argument) {
 #endif
 }
 
-Clock::time_point after_ns(uint64_t ns) {
-  const auto now = Clock::now();
+Clock::time_point after_ns(Clock::time_point now, uint64_t ns) {
   if (ns > uint64_t(365) * 24 * 3600 * 1000000000ull) return Clock::time_point::max();
   return now + std::chrono::nanoseconds(ns);
 }
 
 } // namespace
 
-// the recompiled code's view of the host: memory slow paths, code lookup, svcs
+// the recompiled code's view of the host: code lookup, svcs (memory is Memory::fastmem)
 struct Callbacks {
   static Kernel& kernel(Context* ctx);
-  static uint8_t read8(Context* ctx, uint32_t a) {
-    uint8_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 1);
-    return v;
-  }
-  static uint16_t read16(Context* ctx, uint32_t a) {
-    uint16_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 2);
-    return v;
-  }
-  static uint32_t read32(Context* ctx, uint32_t a) {
-    uint32_t v = 0;
-    kernel(ctx).memory_.read(a, &v, 4);
-    return v;
-  }
-  static void write8(Context* ctx, uint32_t a, uint8_t v) { kernel(ctx).memory_.write(a, &v, 1); }
-  static void write16(Context* ctx, uint32_t a, uint16_t v) { kernel(ctx).memory_.write(a, &v, 2); }
-  static void write32(Context* ctx, uint32_t a, uint32_t v) { kernel(ctx).memory_.write(a, &v, 4); }
   static void interpret(Context* ctx, uint32_t address, uint32_t opcode) {
     char why[96];
     std::snprintf(why, sizeof why, "instruction %08x at %08x is not recompiled (no interpreter)", opcode, address);
@@ -116,12 +99,15 @@ Kernel& Callbacks::kernel(Context*) { return *the_kernel; }
 
 Kernel::Kernel(Memory& memory, const Module& module) : memory_(memory), module_(module) {
   the_kernel = this;
-  host_ = Host{Callbacks::read8,  Callbacks::read16,    Callbacks::read32, Callbacks::write8, Callbacks::write16,
-               Callbacks::write32, Callbacks::interpret, Callbacks::lookup, Callbacks::svc};
+  host_ = Host{Callbacks::interpret, Callbacks::lookup, Callbacks::svc};
+}
+
+Clock::time_point Kernel::now() const {
+  return virtual_ ? start_ + std::chrono::nanoseconds(vt_ns_) : Clock::now();
 }
 
 uint64_t Kernel::ticks() const {
-  const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start_).count();
+  const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now() - start_).count();
   return ns / 1000000000ull * kTicksPerSecond + ns % 1000000000ull * kTicksPerSecond / 1000000000ull;
 }
 
@@ -140,6 +126,12 @@ uint32_t Kernel::allocate(int index, uint32_t size, bool top) {
     return region.base + first * 0x1000;
   }
   return 0;
+}
+
+void Kernel::release(uint32_t physical, uint32_t size) {
+  for (auto& region : regions_)
+    for (uint32_t a = physical; a < physical + size; a += 0x1000)
+      if (a >= region.base && a < region.base + region.size) region.used[(a - region.base) / 0x1000] = false;
 }
 
 void Kernel::load(const Image& image) {
@@ -170,8 +162,11 @@ void Kernel::load(const Image& image) {
     std::memset(memory_.physical(physical, bytes), 0, bytes);
     memory_.map(bss_start, physical, bytes, true);
   }
+  // the code's extent, as QueryMemory tells it
+  code_ = {image.text_address, image.text_address + image.text_pages * 0x1000, image.ro_address + image.ro_pages * 0x1000,
+           std::max(bss_start, (bss_end + 0xFFF) & ~0xFFFu)};
   // the main thread's stack, ending at 0x10000000
-  const uint32_t stack = (std::max(image.stack_size, 0x4000u) + 0xFFF) & ~0xFFFu;
+  const uint32_t stack =(std::max(image.stack_size, 0x4000u) + 0xFFF) & ~0xFFFu;
   const uint32_t stack_physical = allocate(kApplication, stack, true);
   std::memset(memory_.physical(stack_physical, stack), 0, stack);
   memory_.map(0x10000000 - stack, stack_physical, stack, true);
@@ -197,6 +192,12 @@ void Kernel::load(const Image& image) {
   std::memcpy(shared + 0x60, mac, 6);
   shared[0x66] = 3, shared[0x67] = 2;
   shared[0x85] = 0x15; // battery
+  // CTRN_STEREO (anaglyph or sbs): the 3D slider all the way up, so games draw the right eye (0x84 stays 0: set,
+  // NSMB2 takes a constant instead of the slider)
+  if (const char* stereo = std::getenv("CTRN_STEREO"); stereo && *stereo) {
+    const float up = 1.0f;
+    std::memcpy(shared + 0x80, &up, 4);
+  }
   // shortcut: the date and time slots (0x20, 0x40) stay 0; fill them from the host clock when a game reads them
 
   create_thread(image.text_address, 0x10000000, 0, image.priority); // the main thread: no handle, as Zakuro
@@ -217,8 +218,7 @@ std::shared_ptr<Thread> Kernel::create_thread(uint32_t entry, uint32_t stack, ui
   c.fpscr = &thread->fpscr;
   c.host = &host_;
   c.user = thread.get();
-  c.read_pages = memory_.read_pages();
-  c.write_pages = memory_.write_pages();
+  c.fastmem = memory_.fastmem();
   map_tls(*thread);
   threads_.push_back(thread);
   start_host_thread([](void* p) { the_kernel->thread_main(static_cast<Thread*>(p)); }, thread.get());
@@ -257,10 +257,32 @@ std::shared_ptr<Object> Kernel::resolve(uint32_t handle) {
   return found == handles_.end() ? nullptr : found->second;
 }
 
+void Kernel::print_threads() {
+  static const char* states[] = {"ready", "running", "sleeping", "waiting", "arbiter", "dead"};
+  static const char* kinds[] = {"thread", "event", "mutex", "semaphore", "timer", "arbiter", "shared", "session", "port", "process", "limit"};
+  const auto at = now();
+  for (const auto& t : threads_) {
+    if (t->state == Thread::State::Dead) continue;
+    std::printf("[threads] id %u prio %d %s pc %08x lr %08x sp %08x", t->id, t->priority, states[static_cast<int>(t->state)],
+                t->ctx.r[15], t->ctx.r[14], t->ctx.r[13]);
+    if (t->wake_at != Clock::time_point::max())
+      std::printf(" wakes in %.3f ms", std::chrono::duration<double, std::milli>(t->wake_at - at).count());
+    for (const auto& o : t->waiting) {
+      std::printf(" %s%s", t->wait_all ? "&" : "|", kinds[static_cast<int>(o->kind)]);
+      if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port) std::printf(":%s", static_cast<const Session&>(*o).name.c_str());
+      if (o->kind == Object::Kind::Event) std::printf("(%s)", static_cast<const Event&>(*o).signaled ? "set" : "unset");
+      if (o->kind == Object::Kind::Mutex) std::printf("(owner %u)", static_cast<const Mutex&>(*o).owner ? static_cast<const Mutex&>(*o).owner->id : 0);
+    }
+    std::printf("\n");
+  }
+  std::fflush(stdout);
+}
+
 void Kernel::stop(const std::string& why) {
   // with or without the lock: only flags here
   if (!stopped_.exchange(true)) why_ = why;
   finished_.notify_all();
+  reached_.notify_all();
   wake_timekeeper_.notify_all();
 }
 
@@ -269,7 +291,7 @@ void Kernel::native_call(Thread& self, const std::function<void()>& work) {
   work();
   if (std::any_of(threads_.begin(), threads_.end(),
                   [&](auto& t) { return t.get() != &self && t->state == Thread::State::Ready; })) {
-    self.wake_at = Clock::now() + kRequest;
+    self.wake_at = now() + kRequest;
     self.state = Thread::State::Sleeping;
     block(self, lock);
   }
@@ -290,6 +312,21 @@ void Kernel::report() const {
   std::printf("[host] the game called the 3DS system %llu times (of which %llu service requests):\n",
               (unsigned long long)svcs, (unsigned long long)requests);
   for (auto& [count, line] : lines) std::printf("  %10llu  %s\n", (unsigned long long)count, line.c_str());
+  // who waits on what at the end: a run that stops drawing is usually a thread waiting forever
+  static const char* states[] = {"ready", "running", "sleeping", "wait-sync", "wait-arbiter", "dead"};
+  for (const auto& t : threads_) {
+    if (t->state == Thread::State::Dead) continue;
+    std::printf("[host] thread %u prio %d %s, last dispatch %08x lr %08x", t->id, t->priority,
+                states[static_cast<int>(t->state)], t->last_pc, t->ctx.r[14]);
+    for (const auto& o : t->waiting) {
+      if (o->kind == Object::Kind::Session || o->kind == Object::Kind::Port)
+        std::printf(" [%s]", static_cast<const Session&>(*o).name.c_str());
+      else
+        for (const auto& [handle, object] : handles_)
+          if (object == o) std::printf(" [handle %x kind %d]", handle, static_cast<int>(o->kind));
+    }
+    std::printf("\n");
+  }
 }
 
 // ---- scheduling
@@ -326,7 +363,7 @@ void Kernel::acquire(Object& object, Thread& waiter) {
 }
 
 void Kernel::pass() {
-  const auto now = Clock::now();
+  const auto now = this->now();
   // in thread-table order, as Zakuro: it decides who gets a contended object
   for (auto& t : threads_) {
     switch (t->state) {
@@ -385,6 +422,9 @@ Thread* Kernel::pick() {
 void Kernel::hand_to(Thread* next) {
   running_ = next;
   preempt_ = false;
+  // the time no game thread can run: the game waits for the console, not for the host's CPU
+  if (!next && idle_since_ == Clock::time_point{}) idle_since_ = Clock::now();
+  if (next && idle_since_ != Clock::time_point{}) idle_ += Clock::now() - idle_since_, idle_since_ = {};
   if (next) {
     next->state = Thread::State::Running;
     next->baton.notify_one();
@@ -413,8 +453,49 @@ void Kernel::block(Thread& self, std::unique_lock<std::mutex>& lock) {
   reschedule(self, lock);
 }
 
+void Kernel::advance_to(uint64_t ns, std::unique_lock<std::mutex>& lock) {
+  target_ns_ = ns;
+  wake_timekeeper_.notify_one();
+  reached_.wait(lock, [&] {
+    if (stopped_) return true;
+    if (running_) return false;
+    pass();
+    return !pick() && vt_ns_ >= target_ns_;
+  });
+}
+
+void Kernel::virtual_keeper(std::unique_lock<std::mutex>& lock) {
+  // CTRN_FIXED_STEP: time is the game's own. It moves only when no game thread can run: to the next deadline, or
+  // to where the host waits (its next audio block or frame), never by the host's clock; the same run, the same game
+  while (!stopped_) {
+    pass();
+    if (!running_) {
+      if (Thread* next = pick()) {
+        hand_to(next);
+      } else {
+        auto earliest = Clock::time_point::max();
+        for (auto& t : threads_)
+          if (t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
+              t->state == Thread::State::WaitArbiter)
+            earliest = std::min(earliest, t->wake_at);
+        const auto target = start_ + std::chrono::nanoseconds(target_ns_);
+        if (earliest <= target) {
+          if (earliest > now())
+            vt_ns_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - start_).count());
+          continue;
+        }
+        vt_ns_ = std::max(vt_ns_, target_ns_);
+        reached_.notify_all();
+      }
+    }
+    wake_timekeeper_.wait(lock);
+  }
+  reached_.notify_all();
+}
+
 void Kernel::timekeeper() {
   auto lock = this->lock();
+  if (virtual_) return virtual_keeper(lock);
   while (!stopped_) {
     pass();
     if (!running_) {
@@ -423,18 +504,32 @@ void Kernel::timekeeper() {
       // a higher priority woke (a timeout, a host signal): the running thread
       // gives way at its next budget check; so does one starving the others
       Thread* next = pick();
-      const bool starving = next == running_ && Clock::now() - running_->running_since > kStarving &&
+      // the console never takes the core from a thread for one of lower priority: code may count on it, and
+      // Pokémon Y corrupted a list of its own when this did. CTRN_STARVING_RELIEF=1 does, for diagnosis only
+      static const bool relief = std::getenv("CTRN_STARVING_RELIEF") != nullptr;
+      const bool starving = relief && next == running_ && Clock::now() - running_->running_since > kStarving &&
                             std::any_of(threads_.begin(), threads_.end(), [&](auto& t) {
                               return t.get() != running_ && t->state == Thread::State::Ready;
                             });
       if (next != running_ || starving) preempt_ = true;
     }
     auto deadline = Clock::now() + std::chrono::milliseconds(2); // the starvation check's period
+    bool timed = false; // a game thread's own deadline, not the check's
     for (auto& t : threads_)
-      if (t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
-          t->state == Thread::State::WaitArbiter)
-        deadline = std::min(deadline, t->wake_at);
-    wake_timekeeper_.wait_until(lock, deadline);
+      if ((t->state == Thread::State::Sleeping || t->state == Thread::State::WaitSync ||
+           t->state == Thread::State::WaitArbiter) && t->wake_at <= deadline)
+        deadline = t->wake_at, timed = true;
+    // the host's waits wake a millisecond late or more (Windows' timer): a game's short sleeps and the
+    // pauses after its requests (tens of microseconds) would take that long each, its loading crawl;
+    // so the last millisecond before a game's deadline is waited by spinning, the lock let go
+    constexpr auto kSpin = std::chrono::milliseconds(1);
+    if (timed && deadline - Clock::now() <= kSpin) {
+      lock.unlock();
+      while (Clock::now() < deadline && !stopped_) std::this_thread::yield();
+      lock.lock();
+    } else {
+      wake_timekeeper_.wait_until(lock, timed ? deadline - kSpin : deadline);
+    }
   }
 }
 
@@ -458,13 +553,18 @@ void Kernel::thread_main(Thread* self) {
       fprintf(stderr, "[kernel] bad pc %08x, last dispatch %08x, lr %08x sp %08x r0-r3 %08x %08x %08x %08x prio %d, stack:",
               pc, self->last_pc, c.r[14], c.r[13], c.r[0], c.r[1], c.r[2], c.r[3], self->priority);
       for (uint32_t a = c.r[13], n = 0; n < 16 && a < c.r[13] + 0x400; a += 4) {
-        uint8_t* page = c.read_pages[a >> 12];
+        uint8_t* page = memory_.read_pages()[a >> 12];
         if (!page) break;
         uint32_t w;
         memcpy(&w, page + (a & 0xFFF), 4);
         if (w >= 0x100000 && w < 0x3E0000) fprintf(stderr, " %08x", w), n++;
       }
       fprintf(stderr, "\n");
+      // a virtual call through a null entry: r0 the object, its first word the table
+      const uint32_t table = memory_.read32(c.r[0]);
+      fprintf(stderr, "[kernel] r0 points at %08x %08x %08x %08x; table %08x: %08x %08x %08x %08x\n",
+              memory_.read32(c.r[0]), memory_.read32(c.r[0] + 4), memory_.read32(c.r[0] + 8), memory_.read32(c.r[0] + 12),
+              table, memory_.read32(table), memory_.read32(table + 4), memory_.read32(table + 8), memory_.read32(table + 12));
       char why[64];
       std::snprintf(why, sizeof why, "no recompiled code at %08x", pc);
       stop(why);
@@ -559,8 +659,33 @@ std::string Kernel::wait() {
 void Kernel::svc(Thread& self, uint32_t number) {
   Context& c = self.ctx;
   uint32_t* r = c.r;
+  if (number == 0xF0) { // the launcher's natives: the host's own work, no kernel state (they lock their own)
+    const bool taken = natives_ && natives_(self, r[12]);
+    if (!taken) r[12] = 0;
+    return;
+  }
+  if (number == 0xF2) { // CTRN_FORCE_ARGS (ctrn.py): r12 the game's value, made CTRN_FORCE_<function>'s (hex) when
+    // set, and when CTRN_FORCE_<function>_BELOW is unset or above the game's (its levels, not its menus)
+    char name[48];
+    std::snprintf(name, sizeof name, "CTRN_FORCE_%08X", r[15]);
+    if (const char* value = std::getenv(name)) {
+      std::strcat(name, "_BELOW");
+      const char* below = std::getenv(name);
+      if (!below || r[12] < std::strtoul(below, nullptr, 16)) r[12] = static_cast<uint32_t>(std::strtoul(value, nullptr, 16));
+    }
+    return;
+  }
+  if (number == 0xF1) { // CTRN_TRACE_FUNCS (ctrn.py): a traced function returned; r15 is it, r3 its result, r4 its caller
+    static const bool all = std::getenv("CTRN_TRACE_ALL") != nullptr;
+    if (all || r[3] == 0)
+      std::printf("[trace] %08x(%08x, %08x, %08x) -> %08x, from %08x\n", r[15], r[0], r[1], r[2], r[3], r[4]),
+          std::fflush(stdout); // a crash may follow
+    return;
+  }
   auto lock = this->lock();
   ++svc_sites_[{number, r[14]}];
+  // the game's time moves on as it works; the host's natives (0xF0) cost it nothing: with or without them, the same run
+  if (virtual_ && number != 0xF0) vt_ns_ += kSvcNanoseconds;
   auto signed64 = [](uint32_t low, uint32_t high) { return static_cast<int64_t>(uint64_t{high} << 32 | low); };
   // a state change: whoever should run now runs (only higher priority preempts)
   auto yield = [&] { reschedule(self, lock); };
@@ -569,6 +694,11 @@ void Kernel::svc(Thread& self, uint32_t number) {
   case 0x01: { // ControlMemory(op, addr0, addr1, size, perm) -> address
     const uint32_t op = r[0] & 0xFF, addr0 = r[1], addr1 = r[2], size = r[3];
     const bool linear = r[0] & 0x10000;
+    // CTRN_LOG_MEMORY=1: each request, to see a game's heaps take shape
+    static const bool log_memory = std::getenv("CTRN_LOG_MEMORY") != nullptr;
+    if (log_memory)
+      std::printf("[kernel] ControlMemory op %x%s %08x %08x size %x (from %08x)\n", op, linear ? " linear" : "", addr0, addr1,
+                  size, r[14]);
     if (size & 0xFFF) {
       r[0] = kMisalignedSize;
       break;
@@ -576,6 +706,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     if (op == 3 && linear) {
       const uint32_t physical = allocate(kApplication, size, false);
       if (!physical) {
+        std::printf("[kernel] ControlMemory: no %x contiguous bytes left for the linear heap\n", size);
         r[0] = kOutOfMemory;
         break;
       }
@@ -586,6 +717,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
       // the heap: physically contiguous from the top, not zeroed (as Zakuro)
       const uint32_t base = addr0 ? addr0 : heap_top_, physical = allocate(kApplication, size, true);
       if (!physical) {
+        std::printf("[kernel] ControlMemory: no %x bytes left for the heap\n", size); // the game may go on without
         r[0] = kOutOfMemory;
         break;
       }
@@ -619,12 +751,32 @@ void Kernel::svc(Thread& self, uint32_t number) {
     }
     break;
   }
+  case 0x02: { // QueryMemory(_, _, address) -> base, size, permission, state, page flags
+    // what the console says of the block of pages around address that share a kind: the game's code
+    // (text RX, read-only data R, data and bss RW, all "Code"), the linear heap ("Continuous", 7), the
+    // main stack ("Locked", 11), other mapped memory ("Private", 5), nothing mapped ("Free", 0)
+    auto kind = [&](uint32_t page) -> uint32_t { // permission | state << 8
+      const uint32_t a = page << 12;
+      if (!memory_.read_pages()[page]) return 0;
+      if (a >= code_.text && a < code_.end) return (a < code_.text_end ? 5 : a < code_.ro_end ? 1 : 3) | 4 << 8;
+      const uint32_t permission = memory_.write_pages()[page] ? 3 : 1;
+      if (a >= linear_base_ && a < linear_base_ + Memory::kFcramSize) return permission | 7 << 8;
+      if (a >= 0x0E000000 && a < 0x10000000) return permission | 11 << 8;
+      return permission | 5 << 8;
+    };
+    const uint32_t page = r[2] >> 12, at = kind(page);
+    uint32_t first = page, last = page;
+    while (first > 0 && kind(first - 1) == at) --first;
+    while (last < 0xFFFFF && kind(last + 1) == at) ++last;
+    r[0] = kOk, r[1] = first << 12, r[2] = (last - first + 1) << 12, r[3] = at & 0xFF, r[4] = at >> 8, r[5] = 0;
+    break;
+  }
   case 0x03: stop("the game exited"); break;
   case 0x08: { // CreateThread(priority, entry, argument, stack, processor) -> handle
     // shortcut: every thread on the application core, the processor id ignored (as Zakuro)
     if (std::getenv("CTRN_LOG_THREADS"))
-      fprintf(stderr, "[kernel] thread entry %08x prio %d arg %08x stack top %08x, created from %08x by a prio %d thread\n",
-              r[1], int(r[0]), r[2], r[3], r[14], self.priority);
+      fprintf(stderr, "[kernel] thread entry %08x prio %d arg %08x stack top %08x core %d, created from %08x by a prio %d thread\n",
+              r[1], int(r[0]), r[2], r[3], int(r[4]), r[14], self.priority);
     auto thread = create_thread(r[1], r[3], r[2], static_cast<int>(r[0]));
     r[0] = kOk, r[1] = add_handle(thread);
     yield();
@@ -642,9 +794,9 @@ void Kernel::svc(Thread& self, uint32_t number) {
         return t.get() != &self && (t->state == Thread::State::Ready || t->state == Thread::State::Running);
       });
       if (!others) break;
-      self.wake_at = Clock::now() + kYield;
+      self.wake_at = now() + kYield;
     } else {
-      self.wake_at = after_ns(ns);
+      self.wake_at = after_ns(now(), ns);
     }
     self.state = Thread::State::Sleeping;
     block(self, lock);
@@ -822,7 +974,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     }
     if (type == 2 || type == 4) memory_.write32(address, static_cast<uint32_t>(current - 1));
     if (arbiter) arbiter->waiting.emplace_back(&self, address);
-    self.wake_at = (type == 3 || type == 4) && timeout >= 0 ? after_ns(static_cast<uint64_t>(timeout))
+    self.wake_at = (type == 3 || type == 4) && timeout >= 0 ? after_ns(now(), static_cast<uint64_t>(timeout))
                                                              : Clock::time_point::max();
     self.state = Thread::State::WaitArbiter;
     block(self, lock);
@@ -881,7 +1033,7 @@ void Kernel::svc(Thread& self, uint32_t number) {
     }
     self.waiting = std::move(objects);
     self.wait_all = all;
-    self.wake_at = timeout < 0 ? Clock::time_point::max() : after_ns(static_cast<uint64_t>(timeout));
+    self.wake_at = timeout < 0 ? Clock::time_point::max() : after_ns(now(), static_cast<uint64_t>(timeout));
     self.state = Thread::State::WaitSync;
     block(self, lock);
     r[0] = self.result0;
@@ -920,6 +1072,13 @@ void Kernel::svc(Thread& self, uint32_t number) {
       char key[64];
       std::snprintf(key, sizeof key, "%s %04x from %08x", service.c_str(), command[0] >> 16, r[14]);
       ++requests_[key];
+      // CTRN_LOG_IPC=1: every request as it goes (what a game that stops was asking last)
+      // (CTRN_LOG_IPC=all: GPU, DSP and file requests too)
+      static const char* log_ipc = std::getenv("CTRN_LOG_IPC");
+      if (log_ipc && (std::strcmp(log_ipc, "all") == 0 ||
+                      (service != "gsp::Gpu" && service != "dsp::DSP" && service.rfind("FS", 0) != 0)))
+        std::printf("[ipc] %s %08x %08x %08x %08x %08x (thread %u, lr %08x)\n", service.c_str(), command[0], command[1],
+                    command[2], command[3], command[4], self.id, r[14]);
     }
     // the service reads the session's handle in r0 (a file session finds its file by it)
     if (!services_ || !services_(*this, self, service, command)) {
@@ -934,10 +1093,39 @@ void Kernel::svc(Thread& self, uint32_t number) {
     // as Zakuro: a request lets the others run a little while
     if (std::any_of(threads_.begin(), threads_.end(),
                     [&](auto& t) { return t.get() != &self && t->state == Thread::State::Ready; })) {
-      self.wake_at = Clock::now() + kRequest;
+      self.wake_at = now() + kRequest;
       self.state = Thread::State::Sleeping;
       block(self, lock);
     }
+    break;
+  }
+  case 0x2B: { // GetProcessInfo(_, process, type) -> s64
+    uint64_t value;
+    switch (r[2]) {
+    case 0: case 2: { // the memory the process uses (2: its private memory, which is all of it here)
+      uint64_t pages = 0;
+      for (bool used : regions_[kApplication].used) pages += used;
+      value = pages * 0x1000;
+      break;
+    }
+    case 20: value = Memory::kFcram - linear_base_; break; // from a linear address to its physical one, as an offset
+    case 21: value = linear_base_; break;                  // the linear heap's start
+    case 22: value = linear_base_ + regions_[kApplication].size; break; // its end
+    default: {
+      char why[64];
+      std::snprintf(why, sizeof why, "svc 2b (GetProcessInfo) type %u is not native yet", r[2]);
+      stop(why);
+      c.exit = EXIT_UNWIND;
+      return;
+    }
+    }
+    r[0] = kOk, r[1] = static_cast<uint32_t>(value), r[2] = static_cast<uint32_t>(value >> 32);
+    break;
+  }
+  case 0xF0: { // not the console's: a native the launcher's overrides hand a library function to (r12: which one)
+    // r12 back to 0: not taken (yet), the override runs the game's own function
+    const bool taken = natives_ && natives_(self, r[12]);
+    if (!taken) r[12] = 0;
     break;
   }
   case 0x35: // GetProcessId -> 0x22

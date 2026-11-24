@@ -1,4 +1,5 @@
 #include "dsp.hpp"
+#include "aac.hpp"
 
 #include <algorithm>
 #include <array>
@@ -736,6 +737,7 @@ struct Dsp::State {
   std::array<Voice, kVoices> voices;
   Mixer mixer;
   std::vector<int16_t> output; // what came out since the frontend last took it, interleaved
+  Aac aac;                     // the binary pipe's AAC decoder
 
   void reset_pipes() {
     for (auto& pipe : pipes) pipe.clear();
@@ -832,9 +834,13 @@ bool Dsp::handle(Thread& thread, uint32_t* c) {
 
 bool Dsp::write_pipe(uint32_t channel, const std::vector<uint8_t>& data) {
   State& s = *state_;
-  // a request for the AAC decoder, which Zakuro answers at once (dsp_aac.rs)
-  // NOT PORTED: dsp_aac.rs needs a Rust AAC decoder; the run stops here (handle() returns false)
-  if (channel == kPipeBinary && !data.empty()) return false;
+  // a request for the AAC decoder, answered at once in the same pipe (as Zakuro, dsp_aac.rs)
+  if (channel == kPipeBinary && !data.empty()) {
+    const auto answer = s.aac.answer(kernel_.memory(), data.data(), data.size());
+    s.pipes[kPipeBinary].assign(answer.begin(), answer.end());
+    signal_semaphore();
+    return true;
+  }
   if (channel != kPipeAudio || data.empty()) return true;
   switch (data[0]) {
   case kStateInitialize: s.reset_pipes(), s.write_struct_addresses(), s.running = true; break;
