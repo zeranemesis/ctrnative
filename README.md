@@ -61,6 +61,28 @@ de partie, l'hôte dit combien de programmes étaient traduits à l'avance et
 combien l'ont été pendant la partie (chacun est aussi journalisé) ; le but est
 zéro. La traduction est refaite quand picanative change.
 
+### Le menu
+
+`src/menu` est un menu d'accueil à deux écrans, façon console : les icônes des
+jeux en bas (lues dans la ROM), le jeu choisi en haut, ses réglages (échelle de
+rendu, disposition des écrans), et le lancement par `tools/ctrn.py` avec sa
+sortie à l'écran ; le menu revient quand le jeu se ferme. Souris (un clic
+choisit, un second lance), clavier (flèches, Entrée, Tab, Échap) ou manette.
+
+```bash
+cmake -S src/menu -B build-menu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=clang-cl -DSDL3_DIR=<SDL3>/cmake
+cmake --build build-menu
+```
+
+Il lance l'hôte posé à côté de lui (`build-menu/ctrnative.exe`, avec ses DLL),
+sinon celui de `build`. Ses réglages sont dans `%LOCALAPPDATA%\ctrnative\menu.json` :
+`scale`, `layout`, `roms` (dossiers des ROM, séparés par `;`, par défaut
+`C:\jeu 3ds\extrait;C:\jeu 3ds`) et `3dsrecomp` (sinon `CTRN_3DSRECOMP`, sinon
+`../3dsrecomp*/target/release/3dsrecomp.exe`).
+
+### L'hôte seul
+
 L'hôte se lance aussi seul : `build/ctrnative <module> jeu.3ds` (il lit le
 code, décompressé, l'exheader, le titre et la RomFS dans la ROM).
 
