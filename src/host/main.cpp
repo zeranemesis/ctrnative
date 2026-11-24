@@ -334,9 +334,9 @@ int main(int argc, char** argv) {
     const std::string recipes = (std::filesystem::path(argv[1]).parent_path() / "pipelines.pnpl").string();
     std::printf("[host] %u GPU pipelines of earlier runs made again ahead\n", pn_warm_pipelines(engine, recipes.c_str()));
   }
-  // the internal resolution: CTRN_SCALE times the console's (2 by default, 1 = the console's pixels)
+  // the internal resolution: CTRN_SCALE times the console's (1 by default, the console's pixels: an improvement is an option)
   const char* scale_env = std::getenv("CTRN_SCALE");
-  pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 2);
+  pn_set_resolution_scale(engine, scale_env ? static_cast<uint32_t>(std::atoi(scale_env)) : 1);
   const bool headless = std::getenv("CTRN_HEADLESS") != nullptr;
   pn_window* window = headless ? nullptr : pn_window_open(engine, title.c_str(), 2, message, sizeof message);
   if (!headless && !window) {
@@ -344,6 +344,24 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (window) pn_window_set_vsync(window, 0); // the loop below paces the frames
+  // CTRN_WINDOW_SHOT=scale: with each screenshot, what a window at that scale shows (w<frame>.ppm), with no window
+  pn_window* look = nullptr;
+  if (const char* shot_scale = std::getenv("CTRN_WINDOW_SHOT"))
+    look = pn_offscreen_open(engine, static_cast<uint32_t>(std::max(1, std::atoi(shot_scale))));
+  // improvements to how the screens are shown, off by default: CTRN_FILTER bilinear (the default), nearest or
+  // sharp; CTRN_EFFECTS a list of fxaa, sharpen, lcd (the 3DS screen's colors), scanlines
+  for (pn_window* target : {window, look}) {
+    if (!target) continue;
+    pn_window* window = target;
+    const std::string filter = std::getenv("CTRN_FILTER") ? std::getenv("CTRN_FILTER") : "";
+    const std::string effects = std::getenv("CTRN_EFFECTS") ? std::getenv("CTRN_EFFECTS") : "";
+    uint32_t mask = 0;
+    if (effects.find("fxaa") != std::string::npos) mask |= PN_EFFECT_FXAA;
+    if (effects.find("sharpen") != std::string::npos) mask |= PN_EFFECT_SHARPEN;
+    if (effects.find("lcd") != std::string::npos) mask |= PN_EFFECT_LCD_COLORS;
+    if (effects.find("scanlines") != std::string::npos) mask |= PN_EFFECT_SCANLINES;
+    pn_window_set_filter(window, filter == "nearest" ? 1 : filter == "sharp" ? 2 : 0, mask);
+  }
   // how the screens share the window: CTRN_LAYOUT stacked (the console's), side, large or top (F10 cycles them)
   if (const char* layout = std::getenv("CTRN_LAYOUT"); window && layout) {
     const std::string name = layout;
@@ -516,6 +534,10 @@ int main(int argc, char** argv) {
         save_screen(engine, memory, screens[0], shot_dir + name, 400);
         std::snprintf(name, sizeof name, "/b%06llu.ppm", static_cast<unsigned long long>(frames));
         save_screen(engine, memory, screens[1], shot_dir + name, 320); // the bottom screen
+        if (look) {
+          std::snprintf(name, sizeof name, "/w%06llu.ppm", static_cast<unsigned long long>(frames));
+          pn_window_shot(look, screens.data(), (shot_dir + name).c_str());
+        }
       }
     }
     // CTRN_RATE_FRAMES=n: the measure every n frames instead of every 10 s, with the game's own rate (pictures per
