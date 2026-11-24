@@ -1149,6 +1149,15 @@ bool Services::section_in_rom(uint32_t kind, const char* name, HostFile& out) {
   // 5: the update's RomFS (a patch title installed apart); a cartridge's revision has none, its own RomFS is the
   // game's current data (Smash Rev 5 asks for it first)
   if (kind != 0 && kind != 5) return false;
+  // a mod's RomFS (CTRN_ROMFS, built by ctrn.py): the game's files with the mod's in place, a level 3 of its own
+  if (const char* mod = std::getenv("CTRN_ROMFS")) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(mod, error);
+    if (!error) {
+      out = {mod, 0, size, true};
+      return true;
+    }
+  }
   const uint64_t ivfc = ncch + uint64_t{u32(0x1B0)} * 0x200, size = uint64_t{u32(0x1B4)} * 0x200;
   if (!in.seekg(static_cast<std::streamoff>(ivfc)).read(reinterpret_cast<char*>(h), 0x60) || std::memcmp(h, "IVFC", 4)) return false;
   const uint32_t master = u32(0x08), log2 = u32(0x4C);
